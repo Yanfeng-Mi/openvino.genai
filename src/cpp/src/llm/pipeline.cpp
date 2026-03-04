@@ -19,6 +19,63 @@
 
 namespace {
 
+bool is_hybrid_attention_model(const std::filesystem::path& models_path) {
+    // Check config.json for model types that use hybrid attention (linear + SDPA)
+    // These models cannot use PA backend because linear attention states also use beam_idx
+    auto config_path = models_path / "config.json";
+    if (!std::filesystem::exists(config_path)) {
+        return false;
+    }
+    try {
+        std::ifstream config_file(config_path);
+        if (!config_file.is_open()) {
+            return false;
+        }
+        nlohmann::json config = nlohmann::json::parse(config_file);
+        
+        // Check model_type field for known hybrid attention models
+        if (config.contains("model_type")) {
+            std::string model_type = config["model_type"].get<std::string>();
+            // These models use hybrid attention (linear attention + full attention)
+            // and have non-KV-cache states that use beam_idx for reordering,
+            // which SDPAToPagedAttention cannot handle.
+            if (model_type == "qwen3_next" || model_type == "qwen3_5_moe" || model_type == "qwen3_5") {
+                return true;
+            }
+        }
+    } catch (...) {
+        // If we can't parse config, assume it's not hybrid
+        return false;
+    }
+    return false;
+}
+
+bool can_try_auto_pa_backend(const std::filesystem::path& models_path) {
+    if (!std::filesystem::is_directory(models_path)) {
+        return true;
+    }
+    
+    // Check for hybrid attention models first - these cannot use PA backend
+    if (is_hybrid_attention_model(models_path)) {
+        return false;
+    }
+    
+    // Auto-probing PA backend may attempt model loading and then silently fall back.
+    // Limit probing to pre-exported IR directories to avoid double-loading raw model formats.
+    // Also allow safetensors format which is handled by the modeling API.
+    if (std::filesystem::exists(models_path / "openvino_model.xml") ||
+        std::filesystem::exists(models_path / "openvino_language_model.xml")) {
+        return true;
+    }
+    // Check for safetensors files (HuggingFace format) - these may support PA backend
+    for (const auto& entry : std::filesystem::directory_iterator(models_path)) {
+        if (entry.path().extension() == ".safetensors") {
+            return true;
+        }
+    }
+    return false;
+}
+
 // This is a decorator function that wraps a generation callable to apply parsers and reset them before generation if needed.
 ov::genai::DecodedResults run_generate_with_parsers(const ov::genai::OptionalGenerationConfig& generation_config,
                  const ov::genai::StreamerVariant& streamer,
@@ -209,7 +266,7 @@ ov::genai::LLMPipeline::LLMPipeline(
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, tokenizer, scheduler_config, device, device_properties);
-    } else if (attention_backend == PA_BACKEND) {
+    } else if (attention_backend == PA_BACKEND && can_try_auto_pa_backend(models_path)) {
         // try to call CB adapter one more time, but with safe guard to silent exception
         try {
             // we need use CB only for x86 and arm64, as for other architectures like risc-v we can create Paged Attention based model
@@ -247,7 +304,7 @@ ov::genai::LLMPipeline::LLMPipeline(
         // If CB is invoked explicitly, create CB adapter as is and re-throw in case if internal issues
         auto [device_properties, scheduler_config] = utils::extract_scheduler_config(properties, utils::get_latency_oriented_scheduler_config());
         m_pimpl = std::make_unique<ContinuousBatchingAdapter>(models_path, scheduler_config, device, device_properties);
-    } else if (attention_backend == PA_BACKEND) {
+    } else if (attention_backend == PA_BACKEND && can_try_auto_pa_backend(models_path)) {
         // try to call CB adapter one more time, but with safe guard to silent exception
         try {
             // we need use CB only for x86 and arm64, as for other architectures like risc-v we can create Paged Attention based model

@@ -18,6 +18,7 @@
 #include "visual_language/processor_config.hpp"
 
 #include "openvino/genai/streamer_base.hpp"
+#include "modeling/weights/quantization_config.hpp"
 
 namespace ov {
 namespace genai {
@@ -135,6 +136,8 @@ void apply_gather_before_matmul_transformation(std::shared_ptr<ov::Model> model)
 ov::Core& singleton_core();
 
 std::pair<ov::AnyMap, bool> extract_gguf_properties(const ov::AnyMap& external_properties);
+
+std::pair<ov::AnyMap, std::optional<ov::genai::modeling::weights::QuantizationConfig>> extract_quantization_config(const ov::AnyMap& properties);
 
 std::pair<ov::AnyMap, bool> extract_paired_input_props(const ov::AnyMap& external_properties);
 

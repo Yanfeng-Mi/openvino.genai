@@ -65,7 +65,8 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     if (!m_use_full_chat_history)
         m_kv_cache_state.seq_length_axis = kv_pos.seq_len;
 
-    auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(properties);
+    auto [props_no_qconf, qconf_ignored] = utils::extract_quantization_config(properties);
+    auto [filtered_properties_without_gguf, enable_save_ov_model] = utils::extract_gguf_properties(props_no_qconf);
     auto filtered_properties = extract_adapters_from_properties(filtered_properties_without_gguf, &m_generation_config.adapters);
     if (m_generation_config.adapters) {
         m_generation_config.adapters->set_tensor_name_prefix("base_model.model.");
@@ -82,6 +83,17 @@ StatefulLLMPipeline::StatefulLLMPipeline(
     }
     m_model_runner = compiled_model.create_infer_request();
     ov::genai::utils::print_compiled_model_properties(compiled_model, "Stateful LLM model");
+
+    // Detect if model uses 3D position_ids (MRoPE like Qwen3.5)
+    for (const auto& input : compiled_model.inputs()) {
+        if (input.get_any_name() == "position_ids") {
+            auto pshape = input.get_partial_shape();
+            if (pshape.rank().is_static() && pshape.rank().get_length() == 3) {
+                m_has_3d_position_ids = true;
+            }
+            break;
+        }
+    }
 
     // If eos_token_id was not provided, take value
     if (m_generation_config.eos_token_id == -1)
@@ -394,9 +406,29 @@ EncodedResults StatefulLLMPipeline::generate(
 
     bool position_ids_available = (num_inputs == 4);
     std::optional<ov::Tensor> position_ids = std::nullopt;
+    std::optional<int64_t> rope_delta = std::nullopt;
     if (position_ids_available) {
-        position_ids = ov::Tensor{ov::element::i64, input_ids.get_shape()};
-        utils::initialize_position_ids(*position_ids, attention_mask, kv_cache_len);
+        const size_t seq_len = input_ids.get_shape().at(1);
+        if (m_has_3d_position_ids) {
+            // MRoPE (3D position_ids) for models like Qwen3.5
+            // Shape: {3, batch, seq_len}, all 3 dims have same values for text-only
+            position_ids = ov::Tensor{ov::element::i64, {3, batch_size, seq_len}};
+            auto* pos_data = position_ids->data<int64_t>();
+            const size_t plane_stride = batch_size * seq_len;
+            for (size_t b = 0; b < batch_size; ++b) {
+                for (size_t s = 0; s < seq_len; ++s) {
+                    const int64_t pos = static_cast<int64_t>(kv_cache_len + s);
+                    const size_t idx = b * seq_len + s;
+                    pos_data[idx] = pos;                      // t dimension
+                    pos_data[plane_stride + idx] = pos;       // h dimension  
+                    pos_data[2 * plane_stride + idx] = pos;   // w dimension
+                }
+            }
+            rope_delta = 0;  // For text-only input, no visual content shift
+        } else {
+            position_ids = ov::Tensor{ov::element::i64, input_ids.get_shape()};
+            utils::initialize_position_ids(*position_ids, attention_mask, kv_cache_len);
+        }
     }
 
     if(m_adapter_controller) {
@@ -432,7 +464,7 @@ EncodedResults StatefulLLMPipeline::generate(
     }
 
     ov::genai::utils::GenerationFinishInfo finish_info = get_lm_encoded_results(m_model_runner, input_ids, concatenated_attention_mask, streamer_ptr, m_sampler,
-                                                                                requests, position_ids, std::nullopt, m_kv_cache_state, nullptr, std::nullopt, m_max_kv_cache_size);
+                                                                                requests, position_ids, std::nullopt, m_kv_cache_state, nullptr, rope_delta, m_max_kv_cache_size);
     ov::genai::EncodedResults& result = finish_info.results;
     m_chat_generation_finish_status = finish_info.streaming_finish_status;
 

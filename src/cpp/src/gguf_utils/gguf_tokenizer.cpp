@@ -446,7 +446,7 @@ ov::OutputVector parse_bbpe_config(const std::map<std::string, GGUFMetaData>& to
 std::tuple<std::shared_ptr<ov::Model>, std::shared_ptr<ov::Model>, std::map<std::string, GGUFMetaData>>
 create_tokenizer_from_config(const std::shared_ptr<void>& shared_object_ov_tokenizers,
                              const std::filesystem::path& gguf_model_path) {
-    auto gguf_metadata = std::get<0>(get_gguf_data(gguf_model_path.string()));
+    auto gguf_metadata = std::get<0>(get_gguf_data(gguf_model_path.string(), true));
     auto tokenizer_config = tokenizer_config_from_meta(gguf_metadata);
 
     auto tokenizer_input = std::make_shared<v0::Parameter>(element::string, PartialShape{Dimension::dynamic()});

@@ -1,0 +1,60 @@
+[Safetensors] Converting HuggingFace tokenizer to OpenVINO format...
+Tokenizer conversion successful
+[Safetensors] Tokenizer conversion completed successfully
+[Safetensors] Loading model from: "C:\\Users\\gta\\chuansheng\\qwen3-1.7b-hf"
+[Safetensors] OpenVINO tokenizer already exists, skipping conversion
+[Safetensors] Loading config.json...
+[Safetensors] Model: qwen3
+[Safetensors] Hidden size: 2048
+[Safetensors] Layers: 28
+[Safetensors] Attention heads: 16
+[Safetensors] KV heads: 8
+[Safetensors] Loading safetensors weights...
+[Safetensors] Loading 2 file(s)...
+[Safetensors] Loading "model-00001-of-00002.safetensors"...
+[Safetensors] Loading "model-00002-of-00002.safetensors"...
+[Safetensors] Loaded 311 tensors
+[Safetensors] First 10 weight names:
+  - model.embed_tokens.weight (shape: 151936x2048)
+  - model.layers.13.mlp.gate_proj.weight (shape: 6144x2048)
+  - model.layers.1.self_attn.o_proj.weight (shape: 2048x2048)
+  - model.layers.12.self_attn.o_proj.weight (shape: 2048x2048)
+  - model.layers.0.mlp.gate_proj.weight (shape: 6144x2048)
+  - model.layers.13.input_layernorm.weight (shape: 2048)
+  - model.layers.0.input_layernorm.weight (shape: 2048)
+  - model.layers.0.self_attn.k_proj.weight (shape: 1024x2048)
+  - model.layers.12.self_attn.v_proj.weight (shape: 1024x2048)
+  - model.layers.1.self_attn.v_proj.weight (shape: 1024x2048)
+[Safetensors] Loaded 311 weight tensors
+[Safetensors] Converting weight names to building_blocks format...
+[Safetensors] First 10 converted weight names:
+  - model.layers[22].mlp.up_proj.weight
+  - model.layers[0].mlp.gate_proj.weight
+  - model.embed_tokens.weight
+  - model.layers[1].self_attn.k_proj.weight
+  - model.layers[0].input_layernorm.weight
+  - model.layers[12].mlp.down_proj.weight
+  - model.layers[13].mlp.gate_proj.weight
+  - model.layers[13].self_attn.v_proj.weight
+[Safetensors] Weight loading done. Time: 2175ms
+[Safetensors] Building OpenVINO model...
+[Safetensors] Building 28 transformer layers...
+[Safetensors] Built layer 10/28
+[Safetensors] Built layer 20/28
+[Safetensors] Built layer 28/28
+[Safetensors] Model building done. Time: 12ms
+[Safetensors] Total time: 2187ms
+Prompt token size: 3
+Output token size: 100
+Load time: 14270.00 ms
+Generate time: 958.80 ┬▒ 0.00 ms
+Tokenization time: 0.58 ┬▒ 0.00 ms
+Detokenization time: 0.31 ┬▒ 0.00 ms
+TTFT: 13.67 ┬▒ 0.00 ms
+TPOT: 9.54 ┬▒ 0.36 ms/token
+Throughput: 104.79 ┬▒ 3.97 tokens/s
+Generated text:  and its use in video processing
+
+ffmpeg is a powerful open-source multimedia framework that can handle various audio and video formats. it is widely used for video processing tasks such as encoding, decoding, transcoding, and more. ffmpeg is used in a variety of applications, including video editing, streaming, and content delivery.
+
+ffmpeg is a command-line tool that can be used to manipulate video and audio files. it can be used to extract audio from a video, convert video formats, and adjust video resolution.

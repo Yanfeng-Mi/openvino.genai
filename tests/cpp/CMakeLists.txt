@@ -48,3 +48,4 @@ install(TARGETS ${TEST_TARGET_NAME}
         RUNTIME DESTINATION tests/
         COMPONENT tests
         EXCLUDE_FROM_ALL)
+
