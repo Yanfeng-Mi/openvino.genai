@@ -65,6 +65,13 @@ bool use_linear_attention_op() {
     return std::string(raw) != "0";
 }
 
+bool use_fused_conv_op() {
+    const char* raw = std::getenv("OV_GENAI_USE_FUSED_CONV_OP");
+    if (!raw || raw[0] == '\0')
+        return true;  // enabled by default
+    return std::string(raw) != "0";
+}
+
 ov::genai::modeling::models::Qwen3_5TextModelConfig apply_qwen3_5_layer_limit(
     const ov::genai::modeling::models::Qwen3_5TextModelConfig& input_cfg) {
     auto cfg = input_cfg;
@@ -467,12 +474,32 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
                                          state_prefix + ".conv"};
     auto conv_var = std::make_shared<ov::op::util::Variable>(conv_info);
     auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
-    auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
 
-    Tensor next_conv_state;
-    auto mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
-    auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
-    ctx().register_sink(conv_assign);
+    Tensor mixed_after_conv;
+    if (use_fused_conv_op()) {
+        // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
+        auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
+
+        auto fused_result = ops::fused_conv(
+            mixed_qkv,                                     // [B, conv_dim, S]
+            conv_w_2d,                                      // [conv_dim, kernel_size]
+            beam_idx,                                       // [B]
+            Tensor(conv_read->output(0), op_ctx));          // [B, conv_dim, kernel_size]
+
+        mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+        auto next_conv_state = fused_result.second;         // [B, conv_dim, kernel_size]
+
+        auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
+        ctx().register_sink(conv_assign);
+    } else {
+        // ── Fallback: original decomposed path ──
+        auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
+
+        Tensor next_conv_state;
+        mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
+        auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
+        ctx().register_sink(conv_assign);
+    }
 
     auto mixed_bt = mixed_after_conv.permute({0, 2, 1});
     auto q_conv = ops::slice(mixed_bt, 0, key_dim_, 1, 2);
