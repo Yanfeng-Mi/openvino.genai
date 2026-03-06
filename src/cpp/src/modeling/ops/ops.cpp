@@ -124,7 +124,8 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
 std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
                                      const Tensor& conv_weight,
                                      const Tensor& beam_idx,
-                                     const Tensor& initial_state) {
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable) {
     auto* ctx = input.context();
     const Tensor* inputs[] = {&conv_weight, &beam_idx, &initial_state};
     for (const auto* t : inputs) {
@@ -139,7 +140,7 @@ std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
 
     ov::OutputVector args = {input.output(), conv_weight.output(),
                              beam_idx.output(), initial_state.output()};
-    auto node = std::make_shared<ov::op::FusedConv>(args);
+    auto node = std::make_shared<ov::op::FusedConv>(args, variable);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 
