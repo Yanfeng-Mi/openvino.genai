@@ -197,8 +197,7 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
                                    const Tensor& beam_idx,
                                    const Tensor& rope_cos,
                                    const Tensor& rope_sin,
-                                   const Tensor* attention_mask,
-                                   const Tensor* precomputed_sdpa_mask) const {
+                                   const Tensor* attention_mask) const {
     auto* policy = &ctx().op_policy();
     auto* op_ctx = hidden_states.context();
 
@@ -214,26 +213,18 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto v_heads = v_states.permute({0, 2, 1, 3});
 
     if (rotary_dim_ > 0) {
-        // Directly rotate full heads when internal RoPE is enabled.
-        // This avoids slice/concat around partial rotary dimensions.
-        const bool direct_full_head_rope = (!policy || policy->use_internal_rope || rotary_dim_ == head_dim_);
-        if (direct_full_head_rope) {
-            q_heads = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, rotary_dim_, policy);
-            k_heads = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, rotary_dim_, policy);
+        auto q_rot = ops::slice(q_heads, 0, rotary_dim_, 1, 3);
+        auto k_rot = ops::slice(k_heads, 0, rotary_dim_, 1, 3);
+        auto q_rotated = ops::llm::apply_rope(q_rot, rope_cos, rope_sin, rotary_dim_, policy);
+        auto k_rotated = ops::llm::apply_rope(k_rot, rope_cos, rope_sin, rotary_dim_, policy);
+        if (rotary_dim_ < head_dim_) {
+            auto q_pass = ops::slice(q_heads, rotary_dim_, head_dim_, 1, 3);
+            auto k_pass = ops::slice(k_heads, rotary_dim_, head_dim_, 1, 3);
+            q_heads = ops::concat({q_rotated, q_pass}, 3);
+            k_heads = ops::concat({k_rotated, k_pass}, 3);
         } else {
-            auto q_rot = ops::slice(q_heads, 0, rotary_dim_, 1, 3);
-            auto k_rot = ops::slice(k_heads, 0, rotary_dim_, 1, 3);
-            auto q_rotated = ops::llm::apply_rope(q_rot, rope_cos, rope_sin, rotary_dim_, policy);
-            auto k_rotated = ops::llm::apply_rope(k_rot, rope_cos, rope_sin, rotary_dim_, policy);
-            if (rotary_dim_ < head_dim_) {
-                auto q_pass = ops::slice(q_heads, rotary_dim_, head_dim_, 1, 3);
-                auto k_pass = ops::slice(k_heads, rotary_dim_, head_dim_, 1, 3);
-                q_heads = ops::concat({q_rotated, q_pass}, 3);
-                k_heads = ops::concat({k_rotated, k_pass}, 3);
-            } else {
-                q_heads = q_rotated;
-                k_heads = k_rotated;
-            }
+            q_heads = q_rotated;
+            k_heads = k_rotated;
         }
     }
 
@@ -242,16 +233,10 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    const Tensor* sdpa_mask = precomputed_sdpa_mask;
-    std::optional<Tensor> local_mask;
-    if (!sdpa_mask) {
-        // Build mask from non-repeated K so repeat_kv output can stay single-consumer for SDPA fusion.
-        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
-                                    : ops::llm::build_kv_causal_mask(q_heads, cached.first);
-        sdpa_mask = &(*local_mask);
-    }
-
-    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
+    Tensor mask = attention_mask
+                      ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
+                      : ops::llm::build_kv_causal_mask(q_heads, cached.first);
+    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, &mask, false, policy);
 
     const int64_t attn_hidden = static_cast<int64_t>(num_heads_) * static_cast<int64_t>(head_dim_);
     auto merged = attn.permute({0, 2, 1, 3}).reshape({0, 0, attn_hidden});
@@ -668,8 +653,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                                          const Tensor* full_attention_mask,
                                                          const Tensor* linear_attention_mask,
                                                          const Tensor* cache_position,
-                                                         const std::optional<Tensor>& residual,
-                                                         const Tensor* precomputed_full_attn_sdpa_mask) const {
+                                                         const std::optional<Tensor>& residual) const {
     Tensor normed;
     Tensor next_residual;
     if (residual) {
@@ -683,12 +667,7 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
 
     Tensor mixed;
     if (layer_type_ == "full_attention") {
-        mixed = self_attn_->forward(normed,
-                                    beam_idx,
-                                    rope_cos,
-                                    rope_sin,
-                                    full_attention_mask,
-                                    precomputed_full_attn_sdpa_mask);
+        mixed = self_attn_->forward(normed, beam_idx, rope_cos, rope_sin, full_attention_mask);
     } else {
         mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position);
     }
@@ -824,15 +803,12 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
         hidden_states = embedding_injector_.forward(hidden_states, *visual_embeds, *visual_pos_mask);
     }
     auto cos_sin = build_mrope_cos_sin(position_ids);
-    const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
-    auto* op_ctx = seq_source.context();
-    auto q_len_1d = Tensor(shape::dim(seq_source, 1), op_ctx);
-    auto shared_full_attn_sdpa_mask =
-        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
 
     std::optional<Tensor> linear_mask_view;
     const Tensor* linear_mask = nullptr;
     if (linear_attention_mask) {
+        const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
+        auto* op_ctx = seq_source.context();
         auto q_len = shape::dim(seq_source, 1);
         auto mask_len = shape::dim(*linear_attention_mask, 1);
         auto start = std::make_shared<ov::op::v1::Subtract>(mask_len, q_len);
@@ -855,8 +831,7 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  &full_attention_mask,
                                  linear_mask,
                                  cache_position,
-                                 residual,
-                                 &shared_full_attn_sdpa_mask);
+                                 residual);
         hidden_states = out.first;
         residual = out.second;
     }
