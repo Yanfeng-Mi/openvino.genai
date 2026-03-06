@@ -41,6 +41,9 @@ Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k);
 // attention_mask: [batch, kv_len] where 1=attend, 0=mask (padding).
 // The attention_mask is incorporated into the causal mask to handle padding correctly.
 Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, const Tensor& attention_mask);
+// Build causal+padding mask using q_len and attention_mask (kv_len inferred from attention_mask).
+// q_len must be a rank-1 tensor with one element.
+Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len, const Tensor& attention_mask);
 // Helpers for handling qk_head_dim != v_head_dim in SDPA.
 Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim);
 Tensor slice_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim);

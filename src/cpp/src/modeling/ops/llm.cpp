@@ -201,6 +201,69 @@ Tensor causal_mask(const Tensor& scores) {
     return shape::broadcast_to(mask4d, scores_shape);
 }
 
+namespace {
+
+Tensor build_kv_causal_mask_impl(ov::genai::modeling::OpContext* ctx,
+                                 const ov::Output<ov::Node>& batch,
+                                 const Tensor& q_len_1d,
+                                 const Tensor& kv_len_1d,
+                                 const Tensor* attention_mask) {
+    // Squeeze [1] length tensors to scalars for Range ops.
+    auto q_len_scalar = q_len_1d.squeeze(0);
+    auto kv_len_scalar = kv_len_1d.squeeze(0);
+
+    // cache_len = kv_len - q_len.
+    auto cache_len_scalar = Tensor(
+        std::make_shared<ov::opset13::Subtract>(kv_len_scalar.output(), q_len_scalar.output())->output(0), ctx);
+
+    auto cache_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(cache_len_scalar.output(), ov::element::i32)->output(0), ctx);
+    auto q_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(q_len_scalar.output(), ov::element::i32)->output(0), ctx);
+    auto kv_len_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(kv_len_scalar.output(), ov::element::i32)->output(0), ctx);
+
+    // col indices: [1, kv_len], row indices: [q_len, 1] in absolute token positions.
+    auto col_indices = range(kv_len_i32, 0, 1, ov::element::i32).unsqueeze(0);
+    auto row_indices = range(cache_len_i32, cache_len_i32 + q_len_i32, 1, ov::element::i32).unsqueeze(1);
+    auto causal_cond = less_equal(col_indices, row_indices);  // [q_len, kv_len] bool
+
+    auto zero_val = Tensor(const_scalar(ctx, 0.0f), ctx);
+    auto neg_inf = Tensor(const_scalar(ctx, -65504.0f), ctx);
+
+    if (!attention_mask) {
+        auto mask_2d = where(causal_cond, zero_val, neg_inf);
+        auto mask_4d = mask_2d.unsqueeze({0, 1});
+        auto one_val = const_vec(ctx, std::vector<int64_t>{1});
+        auto target_shape = shape::make({batch, one_val, q_len_1d.output(), kv_len_1d.output()});
+        return shape::broadcast_to(mask_4d, target_shape);
+    }
+
+    // Combine causal and padding constraints in boolean space:
+    // attend = causal_cond && (attention_mask != 0), then map to {0, -inf}.
+    auto attn_i32 = Tensor(
+        std::make_shared<ov::op::v0::Convert>(attention_mask->output(), ov::element::i32)->output(0), ctx);
+    auto zero_i32 = Tensor(const_scalar(ctx, int32_t{0}), ctx);
+    auto valid_tokens = Tensor(
+        std::make_shared<ov::op::v1::NotEqual>(attn_i32.output(), zero_i32.output())->output(0), ctx);  // [B, kv_len]
+
+    auto causal_4d = causal_cond.unsqueeze({0, 1});      // [1, 1, q_len, kv_len]
+    auto valid_tokens_4d = valid_tokens.unsqueeze({1, 2});  // [B, 1, 1, kv_len]
+    auto can_attend = Tensor(
+        std::make_shared<ov::op::v1::LogicalAnd>(causal_4d.output(), valid_tokens_4d.output())->output(0), ctx);
+    auto combined_mask = where(can_attend, zero_val, neg_inf);  // [B, 1, q_len, kv_len]
+
+    // Keep NPU/NPUW-identifiable SDPA mask pattern.
+    auto zero_1d = const_vec(ctx, std::vector<int64_t>{0});
+    auto max_1d = const_vec(ctx, std::vector<int64_t>{std::numeric_limits<int64_t>::max()});
+    auto one_1d = const_vec(ctx, std::vector<int64_t>{1});
+    auto axis_1d = const_vec(ctx, std::vector<int64_t>{3});
+    auto slice_node = std::make_shared<ov::op::v8::Slice>(combined_mask.output(), zero_1d, max_1d, one_1d, axis_1d);
+    return Tensor(slice_node, ctx);
+}
+
+}  // namespace
+
 Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k) {
     // Build causal mask for KV cache scenario:
     // Q: [batch, heads, q_len, head_dim]
@@ -210,155 +273,40 @@ Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k) {
     // For prefill: q_len=N, kv_len=N, behaves like standard causal mask
     // For decode: q_len=1, kv_len=cache_len+1, allows attending to all positions
     auto* ctx = q.context();
-
-    // Get dimensions as shape [1] tensors
-    auto batch = shape::dim(q, 0);  // [1]
-    auto q_len = shape::dim(q, 2);  // [1]
-    auto kv_len = shape::dim(k, 2); // [1]
-
-    // Squeeze to scalars for Range op
-    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
-    auto kv_len_scalar = Tensor(kv_len, ctx).squeeze(0);
-
-    // Calculate cache_seq_len = kv_len - q_len (as scalar)
-    auto cache_len_scalar = Tensor(
-        std::make_shared<ov::opset13::Subtract>(kv_len_scalar.output(), q_len_scalar.output())->output(0), ctx);
-
-    // Convert to i32 for Range
-    auto cache_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(cache_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto q_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(q_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto kv_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(kv_len_scalar.output(), ov::element::i32)->output(0), ctx);
-
-    // Create col indices: [0, 1, 2, ..., kv_len-1] -> [1, kv_len]
-    auto col_range = range(kv_len_i32, 0, 1, ov::element::i32);
-    auto col_indices = col_range.unsqueeze(0);  // [1, kv_len]
-
-    // Create row indices: [cache_len, cache_len+1, ..., cache_len+q_len-1] -> [q_len, 1]
-    // These represent the absolute positions of query tokens
-    auto q_len_plus_cache = cache_len_i32 + q_len_i32;
-    auto row_range = range(cache_len_i32, q_len_plus_cache, 1, ov::element::i32);
-    auto row_indices = row_range.unsqueeze(1);  // [q_len, 1]
-
-    // Causal condition: col <= row (attend to current and past positions)
-    auto causal_cond = less_equal(col_indices, row_indices);  // [q_len, kv_len]
-
-    // Build mask: 0 where can attend, -inf where masked
-    auto zero_val = Tensor(const_scalar(ctx, 0.0f), ctx);
-    auto neg_inf = Tensor(const_scalar(ctx, -65504.0f), ctx);
-    auto mask_2d = where(causal_cond, zero_val, neg_inf);  // [q_len, kv_len]
-
-    // Expand to [batch, 1, q_len, kv_len]
-    auto mask_4d = mask_2d.unsqueeze({0, 1});
-
-    // Broadcast to batch size
-    auto one_val = const_vec(ctx, std::vector<int64_t>{1});
-    auto target_shape = shape::make({batch, one_val, q_len, kv_len});
-    return shape::broadcast_to(mask_4d, target_shape);
+    auto batch = shape::dim(q, 0);
+    auto q_len = Tensor(shape::dim(q, 2), ctx);
+    auto kv_len = Tensor(shape::dim(k, 2), ctx);
+    return build_kv_causal_mask_impl(ctx, batch, q_len, kv_len, nullptr);
 }
 
 Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, const Tensor& attention_mask) {
     // Build causal mask for KV cache scenario with attention_mask integration.
-    // This function produces a mask structure compatible with NPU/NPUW.
-    //
     // attention_mask: [batch, kv_len] where 1=attend, 0=mask (padding)
     // Q: [batch, heads, q_len, head_dim]
     // K: [batch, heads, kv_len, head_dim]
     // Output: [batch, 1, q_len, kv_len]
-    //
-    // The mask combines causal masking with attention_mask to handle both:
-    // 1. Causal constraint: only attend to current and past positions
-    // 2. Padding mask: don't attend to padded positions
-    
     auto* ctx = q.context();
+    auto batch = shape::dim(q, 0);
+    auto q_len = Tensor(shape::dim(q, 2), ctx);
+    auto kv_len = Tensor(shape::dim(k, 2), ctx);
+    return build_kv_causal_mask_impl(ctx, batch, q_len, kv_len, &attention_mask);
+}
 
-    // Get dimensions
-    auto batch = shape::dim(q, 0);  // [1]
-    auto q_len = shape::dim(q, 2);  // [1]
-    auto kv_len = shape::dim(k, 2); // [1]
+Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len, const Tensor& attention_mask) {
+    auto* ctx = q_len.context() ? q_len.context() : attention_mask.context();
+    if (q_len.context() && attention_mask.context() && q_len.context() != attention_mask.context()) {
+        OPENVINO_THROW("Tensor contexts do not match");
+    }
+    auto batch = shape::dim(attention_mask, 0);
+    auto kv_len = Tensor(shape::dim(attention_mask, 1), ctx);
 
-    // Squeeze to scalars for Range op
-    auto q_len_scalar = Tensor(q_len, ctx).squeeze(0);
-    auto kv_len_scalar = Tensor(kv_len, ctx).squeeze(0);
+    Tensor q_len_1d = q_len;
+    const auto q_rank = q_len.output().get_partial_shape().rank();
+    if (q_rank.is_static() && q_rank.get_length() == 0) {
+        q_len_1d = q_len.unsqueeze(0);
+    }
 
-    // Calculate cache_seq_len = kv_len - q_len (as scalar)
-    auto cache_len_scalar = Tensor(
-        std::make_shared<ov::opset13::Subtract>(kv_len_scalar.output(), q_len_scalar.output())->output(0), ctx);
-
-    // Convert to i32 for Range
-    auto cache_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(cache_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto q_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(q_len_scalar.output(), ov::element::i32)->output(0), ctx);
-    auto kv_len_i32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(kv_len_scalar.output(), ov::element::i32)->output(0), ctx);
-
-    // Create col indices: [0, 1, 2, ..., kv_len-1] -> [1, kv_len]
-    auto col_range = range(kv_len_i32, 0, 1, ov::element::i32);
-    auto col_indices = col_range.unsqueeze(0);  // [1, kv_len]
-
-    // Create row indices: [cache_len, cache_len+1, ..., cache_len+q_len-1] -> [q_len, 1]
-    auto q_len_plus_cache = cache_len_i32 + q_len_i32;
-    auto row_range = range(cache_len_i32, q_len_plus_cache, 1, ov::element::i32);
-    auto row_indices = row_range.unsqueeze(1);  // [q_len, 1]
-
-    // Causal condition: col <= row (attend to current and past positions)
-    auto causal_cond = less_equal(col_indices, row_indices);  // [q_len, kv_len]
-
-    // Build mask values
-    auto zero_val = Tensor(const_scalar(ctx, 0.0f), ctx);
-    auto neg_inf = Tensor(const_scalar(ctx, -65504.0f), ctx);
-    
-    // Causal mask: 0 where can attend, -inf where masked
-    auto causal_mask_2d = where(causal_cond, zero_val, neg_inf);  // [q_len, kv_len]
-
-    // Process attention_mask: [batch, kv_len] -> [batch, 1, 1, kv_len]
-    // Convert attention_mask to float and create mask values
-    // attention_mask: 1=attend, 0=mask -> we need: 0 for attend, -inf for mask
-    auto attn_mask_f32 = Tensor(
-        std::make_shared<ov::op::v0::Convert>(attention_mask.output(), ov::element::f32)->output(0), ctx);
-    
-    // Create padding mask: where attention_mask==0, use -inf; where ==1, use 0
-    auto attn_zero = Tensor(const_scalar(ctx, 0.0f), ctx);
-    auto attn_mask_cond = Tensor(
-        std::make_shared<ov::op::v1::Equal>(attn_mask_f32.output(), attn_zero.output())->output(0), ctx);
-    auto padding_mask = where(attn_mask_cond, neg_inf, zero_val);  // [batch, kv_len]
-    
-    // Expand padding_mask to [batch, 1, 1, kv_len]
-    auto padding_mask_4d = padding_mask.unsqueeze({1, 2});  // [batch, 1, 1, kv_len]
-
-    // Expand causal_mask to [1, 1, q_len, kv_len] for broadcasting
-    auto causal_mask_4d = causal_mask_2d.unsqueeze({0, 1});  // [1, 1, q_len, kv_len]
-
-    // Combine masks: add causal_mask and padding_mask
-    // Result: positions that are either causally masked OR padding-masked get -inf
-    // This works because: 0 + 0 = 0, 0 + (-inf) = -inf, (-inf) + 0 = -inf, (-inf) + (-inf) = -inf
-    auto combined_mask = Tensor(
-        std::make_shared<ov::op::v1::Add>(causal_mask_4d.output(), padding_mask_4d.output())->output(0), ctx);
-    
-    // Clamp to -inf to handle the -inf + -inf = -inf*2 case
-    auto min_val = Tensor(const_scalar(ctx, -65504.0f), ctx);
-    auto clamped_mask = Tensor(
-        std::make_shared<ov::op::v1::Maximum>(combined_mask.output(), min_val.output())->output(0), ctx);
-
-    // NPU/NPUW compatibility: Add a passthrough Slice to make the mask identifiable.
-    // NPUW expects SDPA mask to come from a Slice node for proper processing.
-    auto zero_1d = const_vec(ctx, std::vector<int64_t>{0});
-    auto max_1d = const_vec(ctx, std::vector<int64_t>{std::numeric_limits<int64_t>::max()});
-    auto one_1d = const_vec(ctx, std::vector<int64_t>{1});
-    auto axis_1d = const_vec(ctx, std::vector<int64_t>{3});  // Last dimension
-    
-    auto slice_node = std::make_shared<ov::op::v8::Slice>(
-        clamped_mask.output(),
-        zero_1d,   // start: [0]
-        max_1d,    // stop: [max] (full slice)
-        one_1d,    // step: [1]
-        axis_1d    // axis: [3] (last dim)
-    );
-    
-    return Tensor(slice_node, ctx);
+    return build_kv_causal_mask_impl(ctx, batch, q_len_1d, kv_len, &attention_mask);
 }
 
 Tensor sdpa(const Tensor& q,
