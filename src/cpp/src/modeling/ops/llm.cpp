@@ -361,6 +361,33 @@ Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, con
     return Tensor(slice_node, ctx);
 }
 
+Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len, const Tensor& attention_mask) {
+    auto* ctx = q_len.context() ? q_len.context() : attention_mask.context();
+    if (!ctx) {
+        OPENVINO_THROW("Tensor context is null");
+    }
+    if (q_len.context() && attention_mask.context() && q_len.context() != attention_mask.context()) {
+        OPENVINO_THROW("Tensor contexts do not match");
+    }
+
+    Tensor q_len_1d = q_len;
+    const auto q_rank = q_len.output().get_partial_shape().rank();
+    if (q_rank.is_static() && q_rank.get_length() == 0) {
+        q_len_1d = q_len.unsqueeze(0);
+    }
+
+    auto batch = shape::dim(attention_mask, 0);
+    auto kv_len = shape::dim(attention_mask, 1);
+    auto one = const_vec(ctx, std::vector<int64_t>{1});
+    auto q_shape = shape::make({batch, one, q_len_1d.output(), one});
+    auto k_shape = shape::make({batch, one, kv_len, one});
+
+    auto zero = Tensor(const_scalar(ctx, 0.0f), ctx);
+    auto q_dummy = shape::broadcast_to(zero, q_shape);
+    auto k_dummy = shape::broadcast_to(zero, k_shape);
+    return build_kv_causal_mask_with_attention(q_dummy, k_dummy, attention_mask);
+}
+
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
             const Tensor& v,
