@@ -214,19 +214,8 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto v_heads = v_states.permute({0, 2, 1, 3});
 
     if (rotary_dim_ > 0) {
-        auto q_rot = ops::slice(q_heads, 0, rotary_dim_, 1, 3);
-        auto k_rot = ops::slice(k_heads, 0, rotary_dim_, 1, 3);
-        auto q_rotated = ops::llm::apply_rope(q_rot, rope_cos, rope_sin, rotary_dim_, policy);
-        auto k_rotated = ops::llm::apply_rope(k_rot, rope_cos, rope_sin, rotary_dim_, policy);
-        if (rotary_dim_ < head_dim_) {
-            auto q_pass = ops::slice(q_heads, rotary_dim_, head_dim_, 1, 3);
-            auto k_pass = ops::slice(k_heads, rotary_dim_, head_dim_, 1, 3);
-            q_heads = ops::concat({q_rotated, q_pass}, 3);
-            k_heads = ops::concat({k_rotated, k_pass}, 3);
-        } else {
-            q_heads = q_rotated;
-            k_heads = k_rotated;
-        }
+        q_heads = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, rotary_dim_, policy, head_dim_);
+        k_heads = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, rotary_dim_, policy, head_dim_);
     }
 
     const std::string cache_prefix = full_path().empty() ? name() : full_path();

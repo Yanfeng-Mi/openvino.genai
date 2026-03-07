@@ -22,8 +22,9 @@ std::pair<Tensor, Tensor> rope_cos_sin(const Tensor& positions,
 Tensor apply_rope(const Tensor& x,
                   const Tensor& cos,
                   const Tensor& sin,
-                  int32_t head_dim,
-                  const OpPolicy* policy = nullptr);
+                  int32_t rotary_ndims,
+                  const OpPolicy* policy = nullptr,
+                  int32_t head_size = -1);
 Tensor apply_rope_interleave(const Tensor& x,
                              const Tensor& cos,
                              const Tensor& sin,
