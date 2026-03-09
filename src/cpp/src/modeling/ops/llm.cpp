@@ -110,11 +110,12 @@ Tensor apply_rope(const Tensor& x,
         config.head_cnt = static_cast<size_t>(x_ps[1].get_length());
     }
 
-    // Unsqueeze to 4D: [batch, 1, seq, half_rotary_ndims] to use GPU's 4D RoPE path
-    // which is more thoroughly tested than the 3D path that has indexing bugs
-    auto dtype = x.dtype();
-    auto cos_4d = cos.to(dtype).unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
-    auto sin_4d = sin.to(dtype).unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
+    // Keep cos/sin tables in their original precision.
+    // Internal RoPE kernels already support mixed x/cos/sin precision, and
+    // downcasting trig tables to x.dtype regresses rotation accuracy on GPU.
+    // CPU RoPE also reads cos/sin buffers as float tables.
+    auto cos_4d = cos.unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
+    auto sin_4d = sin.unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
 
     auto rope_node = std::make_shared<op::internal::RoPE>(
         ov::OutputVector{x.output(), cos_4d.output(), sin_4d.output()},
