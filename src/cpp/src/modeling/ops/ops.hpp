@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <memory>
 #include <vector>
+
+#include <openvino/op/util/variable.hpp>
 
 #include "modeling/ops/tensor.hpp"
 
@@ -29,6 +32,11 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
                                            const Tensor& beta,
                                            const Tensor& g,
                                            const Tensor& initial_state);
+std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
+                                     const Tensor& conv_weight,
+                                     const Tensor& beam_idx,
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable);
 Tensor moe3gemm_fused_compressed(const Tensor& input,
                                  const Tensor& gate_inp_weight,
                                  const Tensor& gate_exps_weight,

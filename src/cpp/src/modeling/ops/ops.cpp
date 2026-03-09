@@ -5,6 +5,7 @@
 
 #include <openvino/core/except.hpp>
 #include <openvino/op/linear_attn.hpp>
+#include <openvino/op/fused_conv.hpp>
 #include <openvino/opsets/opset13.hpp>
 #include <openvino/op/placeholder_extension.hpp>
 #include <openvino/op/moe_3gemm_fused_compressed.hpp>
@@ -117,6 +118,29 @@ std::pair<Tensor, Tensor> linear_attention(const Tensor& q,
     // the C++ API parameter order), so we pass g before beta here.
     ov::OutputVector args = {q.output(), k.output(), v.output(), g.output(), beta.output(), initial_state.output()};
     auto node = std::make_shared<ov::op::LinearAttention>(args);
+    return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
+}
+
+std::pair<Tensor, Tensor> fused_conv(const Tensor& input,
+                                     const Tensor& conv_weight,
+                                     const Tensor& beam_idx,
+                                     const Tensor& initial_state,
+                                     const std::shared_ptr<ov::op::util::Variable>& variable) {
+    auto* ctx = input.context();
+    const Tensor* inputs[] = {&conv_weight, &beam_idx, &initial_state};
+    for (const auto* t : inputs) {
+        auto* t_ctx = t->context();
+        if (ctx && t_ctx && ctx != t_ctx) {
+            OPENVINO_THROW("Tensor contexts do not match");
+        }
+        if (!ctx) {
+            ctx = t_ctx;
+        }
+    }
+
+    ov::OutputVector args = {input.output(), conv_weight.output(),
+                             beam_idx.output(), initial_state.output()};
+    auto node = std::make_shared<ov::op::FusedConv>(args, variable);
     return {Tensor(node->output(0), ctx), Tensor(node->output(1), ctx)};
 }
 

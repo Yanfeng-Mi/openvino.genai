@@ -13,6 +13,7 @@
 #include <openvino/op/tensor_iterator.hpp>
 #include <openvino/op/util/variable.hpp>
 #include <openvino/opsets/opset13.hpp>
+#include <ov_ops/rms.hpp>
 
 #include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/llm.hpp"
@@ -59,6 +60,13 @@ std::optional<int32_t> get_qwen3_5_layer_limit_from_env() {
 
 bool use_linear_attention_op() {
     const char* raw = std::getenv("OV_GENAI_USE_LINEAR_ATTENTION_OP");
+    if (!raw || raw[0] == '\0')
+        return true;  // enabled by default
+    return std::string(raw) != "0";
+}
+
+bool use_fused_conv_op() {
+    const char* raw = std::getenv("OV_GENAI_USE_FUSED_CONV_OP");
     if (!raw || raw[0] == '\0')
         return true;  // enabled by default
     return std::string(raw) != "0";
@@ -115,10 +123,11 @@ const Tensor& Qwen3_5RMSNorm::weight() const {
 
 Tensor Qwen3_5RMSNorm::forward(const Tensor& x) const {
     auto x_f32 = x.to(ov::element::f32);
-    auto var = x_f32.pow(2.0f).mean(-1, true);
-    auto norm = x_f32 * (var + eps_).rsqrt();
-    auto scaled = norm * (1.0f + weight().to(ov::element::f32));
-    return scaled.to(x.dtype());
+    // Qwen3.5 uses (1 + weight) as the RMS scale factor.
+    auto gamma = 1.0f + weight().to(ov::element::f32);
+    auto rms_node = std::make_shared<ov::op::internal::RMS>(
+        x_f32.output(), gamma.output(), static_cast<double>(eps_), x.dtype());
+    return Tensor(rms_node->output(0), x.context());
 }
 
 std::pair<Tensor, Tensor> Qwen3_5RMSNorm::forward(const Tensor& x, const Tensor& residual) const {
@@ -188,7 +197,8 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
                                    const Tensor& beam_idx,
                                    const Tensor& rope_cos,
                                    const Tensor& rope_sin,
-                                   const Tensor* attention_mask) const {
+                                   const Tensor* attention_mask,
+                                   const Tensor* precomputed_sdpa_mask) const {
     auto* policy = &ctx().op_policy();
     auto* op_ctx = hidden_states.context();
 
@@ -204,19 +214,8 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto v_heads = v_states.permute({0, 2, 1, 3});
 
     if (rotary_dim_ > 0) {
-        auto q_rot = ops::slice(q_heads, 0, rotary_dim_, 1, 3);
-        auto k_rot = ops::slice(k_heads, 0, rotary_dim_, 1, 3);
-        auto q_rotated = ops::llm::apply_rope(q_rot, rope_cos, rope_sin, rotary_dim_, policy);
-        auto k_rotated = ops::llm::apply_rope(k_rot, rope_cos, rope_sin, rotary_dim_, policy);
-        if (rotary_dim_ < head_dim_) {
-            auto q_pass = ops::slice(q_heads, rotary_dim_, head_dim_, 1, 3);
-            auto k_pass = ops::slice(k_heads, rotary_dim_, head_dim_, 1, 3);
-            q_heads = ops::concat({q_rotated, q_pass}, 3);
-            k_heads = ops::concat({k_rotated, k_pass}, 3);
-        } else {
-            q_heads = q_rotated;
-            k_heads = k_rotated;
-        }
+        q_heads = ops::llm::apply_rope(q_heads, rope_cos, rope_sin, rotary_dim_, policy, head_dim_);
+        k_heads = ops::llm::apply_rope(k_heads, rope_cos, rope_sin, rotary_dim_, policy, head_dim_);
     }
 
     const std::string cache_prefix = full_path().empty() ? name() : full_path();
@@ -224,10 +223,14 @@ Tensor Qwen3_5Attention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    Tensor mask = attention_mask
-                      ? ops::llm::build_kv_causal_mask_with_attention(q_heads, k_expanded, *attention_mask)
-                      : ops::llm::build_kv_causal_mask(q_heads, k_expanded);
-    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, &mask, false, policy);
+    const Tensor* sdpa_mask = precomputed_sdpa_mask;
+    std::optional<Tensor> local_mask;
+    if (!sdpa_mask) {
+        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_heads, cached.first, *attention_mask)
+                                    : ops::llm::build_kv_causal_mask(q_heads, cached.first);
+        sdpa_mask = &(*local_mask);
+    }
+    auto attn = ops::llm::sdpa(q_heads, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
 
     const int64_t attn_hidden = static_cast<int64_t>(num_heads_) * static_cast<int64_t>(head_dim_);
     auto merged = attn.permute({0, 2, 1, 3}).reshape({0, 0, attn_hidden});
@@ -464,13 +467,30 @@ Tensor Qwen3_5GatedDeltaNet::forward(const Tensor& hidden_states,
                                          masked_hidden.dtype(),
                                          state_prefix + ".conv"};
     auto conv_var = std::make_shared<ov::op::util::Variable>(conv_info);
-    auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
-    auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
 
-    Tensor next_conv_state;
-    auto mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
-    auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
-    ctx().register_sink(conv_assign);
+    Tensor mixed_after_conv;
+    if (use_fused_conv_op()) {
+        // ── FusedConv op path: fuses Gather + Concat + GroupConv + SiLU + Slice ──
+        auto conv_w_2d = conv1d_weight().reshape({conv_dim_, conv_kernel_size_}, false);
+
+        auto fused_result = ops::fused_conv(
+            mixed_qkv,                                     // [B, conv_dim, S]
+            conv_w_2d,                                      // [conv_dim, kernel_size]
+            beam_idx,                                       // [B]
+            conv_init,                                       // [B, conv_dim, kernel_size]
+            conv_var);
+
+        mixed_after_conv = fused_result.first;              // [B, conv_dim, S]
+    } else {
+        // ── Fallback: original decomposed path ──
+        auto conv_read = std::make_shared<ov::op::v6::ReadValue>(conv_init.output(), conv_var);
+        auto conv_cached = ops::gather(Tensor(conv_read->output(0), op_ctx), beam_idx, 0);
+
+        Tensor next_conv_state;
+        mixed_after_conv = apply_depthwise_causal_conv(mixed_qkv, conv_cached, &next_conv_state);
+        auto conv_assign = std::make_shared<ov::opset13::Assign>(next_conv_state.output(), conv_var);
+        ctx().register_sink(conv_assign);
+    }
 
     auto mixed_bt = mixed_after_conv.permute({0, 2, 1});
     auto q_conv = ops::slice(mixed_bt, 0, key_dim_, 1, 2);
@@ -627,7 +647,8 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
                                                          const Tensor* full_attention_mask,
                                                          const Tensor* linear_attention_mask,
                                                          const Tensor* cache_position,
-                                                         const std::optional<Tensor>& residual) const {
+                                                         const std::optional<Tensor>& residual,
+                                                         const Tensor* precomputed_full_attn_sdpa_mask) const {
     Tensor normed;
     Tensor next_residual;
     if (residual) {
@@ -641,7 +662,12 @@ std::pair<Tensor, Tensor> Qwen3_5DecoderLayer::forward(const Tensor& hidden_stat
 
     Tensor mixed;
     if (layer_type_ == "full_attention") {
-        mixed = self_attn_->forward(normed, beam_idx, rope_cos, rope_sin, full_attention_mask);
+        mixed = self_attn_->forward(normed,
+                                    beam_idx,
+                                    rope_cos,
+                                    rope_sin,
+                                    full_attention_mask,
+                                    precomputed_full_attn_sdpa_mask);
     } else {
         mixed = linear_attn_->forward(normed, beam_idx, linear_attention_mask, cache_position);
     }
@@ -777,12 +803,15 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
         hidden_states = embedding_injector_.forward(hidden_states, *visual_embeds, *visual_pos_mask);
     }
     auto cos_sin = build_mrope_cos_sin(position_ids);
+    const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
+    auto* op_ctx = seq_source.context();
+    auto q_len_1d = Tensor(shape::dim(seq_source, 1), op_ctx);
+    auto shared_full_attn_sdpa_mask =
+        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
 
     std::optional<Tensor> linear_mask_view;
     const Tensor* linear_mask = nullptr;
     if (linear_attention_mask) {
-        const Tensor& seq_source = inputs_embeds ? *inputs_embeds : *input_ids;
-        auto* op_ctx = seq_source.context();
         auto q_len = shape::dim(seq_source, 1);
         auto mask_len = shape::dim(*linear_attention_mask, 1);
         auto start = std::make_shared<ov::op::v1::Subtract>(mask_len, q_len);
@@ -805,7 +834,8 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
                                  &full_attention_mask,
                                  linear_mask,
                                  cache_position,
-                                 residual);
+                                 residual,
+                                 &shared_full_attn_sdpa_mask);
         hidden_states = out.first;
         residual = out.second;
     }

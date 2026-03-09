@@ -5,6 +5,7 @@
 
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
+#include <ov_ops/rms.hpp>
 
 namespace ov {
 namespace genai {
@@ -41,10 +42,10 @@ const Tensor& RMSNorm::weight() const {
 Tensor RMSNorm::forward(const Tensor& x) const {
     auto orig_dtype = x.dtype();
     auto xf = x.to(ov::element::f32);
-    auto var = xf.pow(2.0f).mean(-1, true);
-    auto norm = xf * (var + eps_).rsqrt();
-    auto w = weight().to(orig_dtype);
-    return norm.to(orig_dtype) * w;
+    auto wf = weight().to(ov::element::f32);
+    auto rms_node = std::make_shared<ov::op::internal::RMS>(
+        xf.output(), wf.output(), static_cast<double>(eps_), orig_dtype);
+    return Tensor(rms_node->output(0), x.context());
 }
 
 std::pair<Tensor, Tensor> RMSNorm::forward(const Tensor& x, const Tensor& residual) const {
@@ -53,11 +54,10 @@ std::pair<Tensor, Tensor> RMSNorm::forward(const Tensor& x, const Tensor& residu
     auto rf = residual.to(ov::element::f32);
     auto sum = xf + rf;
     auto residual_out = sum.to(orig_dtype);
-    auto var = sum.pow(2.0f).mean(-1, true);
-    auto norm = sum * (var + eps_).rsqrt();
-    auto w = weight().to(orig_dtype);
-    auto out = norm.to(orig_dtype) * w;
-    return {out, residual_out};
+    auto wf = weight().to(ov::element::f32);
+    auto rms_node = std::make_shared<ov::op::internal::RMS>(
+        sum.output(), wf.output(), static_cast<double>(eps_), orig_dtype);
+    return {Tensor(rms_node->output(0), x.context()), residual_out};
 }
 
 }  // namespace modeling

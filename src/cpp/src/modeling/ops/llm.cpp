@@ -46,30 +46,45 @@ std::pair<Tensor, Tensor> rope_cos_sin(const Tensor& positions,
 Tensor apply_rope(const Tensor& x,
                   const Tensor& cos,
                   const Tensor& sin,
-                  int32_t head_dim,
-                  const OpPolicy* policy) {
-    if (head_dim % 2 != 0) {
-        OPENVINO_THROW("apply_rope expects even head_dim");
+                  int32_t rotary_ndims,
+                  const OpPolicy* policy,
+                  int32_t head_size) {
+    if (rotary_ndims % 2 != 0) {
+        OPENVINO_THROW("apply_rope expects even rotary_ndims");
     }
-    (void)policy;
-    // Align rotary factors with activation dtype to avoid mixed-type multiplies.
-    auto dtype = x.dtype();
-    auto cos_unsq = cos.to(dtype).unsqueeze(1);
-    auto sin_unsq = sin.to(dtype).unsqueeze(1);
-    int64_t half_dim = head_dim / 2;
+    if (head_size < 0) {
+        head_size = rotary_ndims;
+    }
+    if (head_size < rotary_ndims) {
+        OPENVINO_THROW("apply_rope expects head_size >= rotary_ndims");
+    }
+    const auto x_ps = x.output().get_partial_shape();
+    const auto x_rank = x_ps.rank();
+    if (x_rank.is_static() && x_rank.get_length() > 0) {
+        const auto& last_dim = x_ps[x_rank.get_length() - 1];
+        if (last_dim.is_static() && last_dim.get_length() != head_size) {
+            OPENVINO_THROW("apply_rope head_size mismatch: expected last dim ", head_size, ", got ", last_dim.get_length());
+        }
+    }
+    const int32_t half_rotary_ndims = rotary_ndims / 2;
 
     const bool use_internal = policy ? policy->use_internal_rope : true;
     if (!use_internal) {
-        const int32_t half_dim = head_dim / 2;
         auto cos_cast = cos.to(x.dtype()).unsqueeze(1);  // [B, 1, S, half]
         auto sin_cast = sin.to(x.dtype()).unsqueeze(1);  // [B, 1, S, half]
 
-        auto x1 = slice(x, 0, half_dim, 1, 3);
-        auto x2 = slice(x, half_dim, head_dim, 1, 3);
+        auto x1 = slice(x, 0, half_rotary_ndims, 1, 3);
+        auto x2 = slice(x, half_rotary_ndims, rotary_ndims, 1, 3);
 
         auto out1 = x1 * cos_cast - x2 * sin_cast;
         auto out2 = x1 * sin_cast + x2 * cos_cast;
-        return concat({out1, out2}, 3);
+        auto rotated = concat({out1, out2}, 3);
+        if (head_size == rotary_ndims) {
+            return rotated;
+        }
+
+        auto tail = slice(x, rotary_ndims, head_size, 1, 3);
+        return concat({rotated, tail}, 3);
     }
 
     // Use internal RoPE op directly for optimal GPU performance.
@@ -77,28 +92,30 @@ Tensor apply_rope(const Tensor& x,
     //
     // Input shapes:
     //   x: [batch, heads, seq, head_dim]
-    //   cos/sin: [batch, seq, half_dim] where half_dim = head_dim / 2
+    //   cos/sin: [batch, seq, half_rotary_ndims]
     //
-    // RoPE op expects cos/sin with shape [batch, seq, rotary_ndims] and will
-    // handle the rotation internally.
+    // Keep x at full head_size and pass half-width cos/sin tables directly.
+    // The RoPE kernel can then rotate only rotary_ndims and preserve the tail
+    // without materializing slice/concat scaffolding in the graph.
 
     op::internal::RoPE::Config config;
-    config.rotary_ndims = static_cast<size_t>(head_dim);
+    config.rotary_ndims = static_cast<size_t>(rotary_ndims);
+    config.cos_sin_ndims = static_cast<size_t>(half_rotary_ndims);
     config.is_interleaved = false;
     config.input_trans0213 = false;
     config.output_trans0213 = false;
+    config.head_size = static_cast<size_t>(head_size);
 
-    // Expand cos/sin from half_dim to head_dim by concatenating with themselves
-    auto cos_full = concat({cos, cos}, 2);  // [batch, seq, head_dim]
-    auto sin_full = concat({sin, sin}, 2);  // [batch, seq, head_dim]
+    if (x_ps.rank().is_static() && x_ps.rank().get_length() == 4 && x_ps[1].is_static()) {
+        config.head_cnt = static_cast<size_t>(x_ps[1].get_length());
+    }
 
-    // Unsqueeze to 4D: [batch, 1, seq, head_dim] to use GPU's 4D RoPE path
-    // which is more thoroughly tested than the 3D path that has indexing bugs
-    auto cos_4d = cos_full.unsqueeze(1);  // [batch, 1, seq, head_dim]
-    auto sin_4d = sin_full.unsqueeze(1);  // [batch, 1, seq, head_dim]
-
-    // Since we expanded cos/sin to full head_dim, set cos_sin_ndims accordingly
-    config.cos_sin_ndims = static_cast<size_t>(head_dim);
+    // Keep cos/sin tables in their original precision.
+    // Internal RoPE kernels already support mixed x/cos/sin precision, and
+    // downcasting trig tables to x.dtype regresses rotation accuracy on GPU.
+    // CPU RoPE also reads cos/sin buffers as float tables.
+    auto cos_4d = cos.unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
+    auto sin_4d = sin.unsqueeze(1);  // [batch, 1, seq, half_rotary_ndims]
 
     auto rope_node = std::make_shared<op::internal::RoPE>(
         ov::OutputVector{x.output(), cos_4d.output(), sin_4d.output()},
@@ -112,7 +129,6 @@ Tensor apply_rope_interleave(const Tensor& x,
                              const Tensor& sin,
                              int32_t head_dim,
                              const OpPolicy* policy) {
-    (void)policy;
     const int32_t half_dim = head_dim / 2;
     auto interleaved = x.reshape({0, 0, 0, half_dim, 2})
                            .permute({0, 1, 2, 4, 3})
@@ -174,7 +190,9 @@ Tensor repeat_kv(const Tensor& x, int32_t num_heads, int32_t num_kv_heads, int32
     auto hdim = const_vec(ctx, std::vector<int64_t>{static_cast<int64_t>(head_dim)});
 
     auto target = shape::make({batch, kv_heads, rep, seq, hdim});
-    auto broadcast = shape::broadcast_to(unsq, target);
+    // Use BIDIRECTIONAL broadcast to match GPU's Unsqueeze+Broadcast+Reshape+SDPA fusion pattern.
+    auto broadcast = Tensor(
+        std::make_shared<ov::op::v3::Broadcast>(unsq.output(), target, ov::op::BroadcastType::BIDIRECTIONAL), ctx);
 
     auto heads = const_vec(ctx, std::vector<int64_t>{static_cast<int64_t>(num_heads)});
     auto reshape_shape = shape::make({batch, heads, seq, hdim});
@@ -359,6 +377,33 @@ Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, con
     );
     
     return Tensor(slice_node, ctx);
+}
+
+Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len, const Tensor& attention_mask) {
+    auto* ctx = q_len.context() ? q_len.context() : attention_mask.context();
+    if (!ctx) {
+        OPENVINO_THROW("Tensor context is null");
+    }
+    if (q_len.context() && attention_mask.context() && q_len.context() != attention_mask.context()) {
+        OPENVINO_THROW("Tensor contexts do not match");
+    }
+
+    Tensor q_len_1d = q_len;
+    const auto q_rank = q_len.output().get_partial_shape().rank();
+    if (q_rank.is_static() && q_rank.get_length() == 0) {
+        q_len_1d = q_len.unsqueeze(0);
+    }
+
+    auto batch = shape::dim(attention_mask, 0);
+    auto kv_len = shape::dim(attention_mask, 1);
+    auto one = const_vec(ctx, std::vector<int64_t>{1});
+    auto q_shape = shape::make({batch, one, q_len_1d.output(), one});
+    auto k_shape = shape::make({batch, one, kv_len, one});
+
+    auto zero = Tensor(const_scalar(ctx, 0.0f), ctx);
+    auto q_dummy = shape::broadcast_to(zero, q_shape);
+    auto k_dummy = shape::broadcast_to(zero, k_shape);
+    return build_kv_causal_mask_with_attention(q_dummy, k_dummy, attention_mask);
 }
 
 Tensor sdpa(const Tensor& q,

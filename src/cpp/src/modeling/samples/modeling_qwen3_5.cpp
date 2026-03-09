@@ -372,6 +372,42 @@ ov::Tensor make_zero_tensor(const ov::element::Type& type, const ov::Shape& shap
     return tensor;
 }
 
+// ---------------------------------------------------------------------------
+// USM-host tensor helpers — iGPU zero-copy optimization
+// ---------------------------------------------------------------------------
+// On iGPU, GPU can access USM-host memory directly without H2D copy.
+// This eliminates the costly wait_for_events overhead for each input tensor.
+// Falls back to standard ov::Tensor when the context doesn't support it.
+
+/// Try to get the GPU RemoteContext from a CompiledModel.
+std::optional<ov::RemoteContext> try_get_gpu_context(ov::CompiledModel& compiled) {
+    try {
+        return compiled.get_context();
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+/// Create a USM-host tensor of given type/shape via the GPU context.
+ov::Tensor make_usm_host_tensor(std::optional<ov::RemoteContext>& ctx,
+                                const ov::element::Type& type,
+                                const ov::Shape& shape) {
+    if (ctx.has_value()) {
+        try {
+            return ctx->create_host_tensor(type, shape);
+        } catch (...) {}
+    }
+    return ov::Tensor(type, shape);
+}
+
+/// Create a USM-host tensor and copy data from an existing tensor.
+ov::Tensor clone_as_usm_host(std::optional<ov::RemoteContext>& ctx,
+                              const ov::Tensor& src) {
+    auto dst = make_usm_host_tensor(ctx, src.get_element_type(), src.get_shape());
+    std::memcpy(dst.data(), src.data(), src.get_byte_size());
+    return dst;
+}
+
 std::string resolve_pos_embed_name(ov::genai::modeling::weights::WeightSource& source) {
     const std::vector<std::string> candidates = {
         "model.visual.pos_embed.weight",
@@ -795,14 +831,26 @@ int main(int argc, char* argv[]) try {
 
     auto beam_idx = make_beam_idx(batch);
     auto text_request = compiled_text.create_infer_request();
+
+    // Get GPU context for USM-host tensors (iGPU zero-copy optimization)
+    auto gpu_ctx = try_get_gpu_context(compiled_text);
+
+    // Clone prefill inputs as USM-host for zero-copy on iGPU
+    auto usm_input_ids = clone_as_usm_host(gpu_ctx, input_ids);
+    auto usm_attention_mask = clone_as_usm_host(gpu_ctx, attention_mask);
+    auto usm_position_ids = clone_as_usm_host(gpu_ctx, plan.position_ids);
+    auto usm_beam_idx = clone_as_usm_host(gpu_ctx, beam_idx);
+
     text_request.reset_state();
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, input_ids);
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, attention_mask);
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, plan.position_ids);
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, beam_idx);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, usm_input_ids);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, usm_attention_mask);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_position_ids);
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
     if (use_vl) {
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, visual_padded);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, plan.visual_pos_mask);
+        auto usm_visual_padded = clone_as_usm_host(gpu_ctx, visual_padded);
+        auto usm_visual_pos_mask = clone_as_usm_host(gpu_ctx, plan.visual_pos_mask);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, usm_visual_padded);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, usm_visual_pos_mask);
     }
 
     const auto prefill_start = std::chrono::steady_clock::now();
@@ -818,8 +866,8 @@ int main(int argc, char* argv[]) try {
     const auto stop_token_ids = resolve_stop_token_ids(use_dummy_mode_flag ? std::filesystem::path{} : model_dir,
                                                        tokenizer.get());
 
-    ov::Tensor step_ids(ov::element::i64, {batch, 1});
-    ov::Tensor step_mask(ov::element::i64, {batch, 1});
+    ov::Tensor step_ids = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, 1});
+    ov::Tensor step_mask = make_usm_host_tensor(gpu_ctx, ov::element::i64, {batch, 1});
     auto* step_mask_data = step_mask.data<int64_t>();
     for (size_t b = 0; b < batch; ++b) {
         step_mask_data[b] = 1;
@@ -828,8 +876,10 @@ int main(int argc, char* argv[]) try {
     ov::Tensor decode_visual;
     ov::Tensor decode_visual_mask;
     if (use_vl) {
-        decode_visual = make_zero_tensor(ov::element::f32, {batch, 1, static_cast<size_t>(cfg.text.hidden_size)});
-        decode_visual_mask = make_zero_tensor(ov::element::boolean, {batch, 1});
+        decode_visual = make_usm_host_tensor(gpu_ctx, ov::element::f32, {batch, 1, static_cast<size_t>(cfg.text.hidden_size)});
+        std::memset(decode_visual.data(), 0, decode_visual.get_byte_size());
+        decode_visual_mask = make_usm_host_tensor(gpu_ctx, ov::element::boolean, {batch, 1});
+        std::memset(decode_visual_mask.data(), 0, decode_visual_mask.get_byte_size());
     }
 
     int64_t past_len = prompt_len;
@@ -863,6 +913,12 @@ int main(int argc, char* argv[]) try {
             }
         }
     }
+    // Pre-allocate USM-host tensor for decode position_ids - reuse across steps
+    // to avoid per-step create_host_tensor() + memcpy overhead.
+    // Shape: [3, batch, 1] (3 planes of identical position values per batch element)
+    ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
+    const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
+
     size_t decode_steps = 0;
     const auto decode_start = std::chrono::steady_clock::now();
     for (int step = 1; step < opts.max_new_tokens; ++step) {
@@ -874,15 +930,19 @@ int main(int argc, char* argv[]) try {
             step_data[b] = next_id;
         }
 
-        auto position_ids = ov::genai::modeling::models::Qwen3_5InputPlanner::build_decode_position_ids(
-            plan.rope_deltas,
-            past_len,
-            1);
+        // Fill position_ids in-place: all 3 planes get the same value per batch element
+        auto* pos_data = usm_decode_pos.data<int64_t>();
+        for (size_t b = 0; b < batch; ++b) {
+            const int64_t value = past_len + rope_deltas_data[b];
+            pos_data[b] = value;             // plane 0
+            pos_data[batch + b] = value;     // plane 1
+            pos_data[2 * batch + b] = value; // plane 2
+        }
 
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kAttentionMask, step_mask);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, position_ids);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, beam_idx);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kPositionIds, usm_decode_pos);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kBeamIdx, usm_beam_idx);
         if (use_vl) {
             text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualEmbeds, decode_visual);
             text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kVisualPosMask, decode_visual_mask);
