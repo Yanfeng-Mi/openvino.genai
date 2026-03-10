@@ -150,12 +150,13 @@ TEST(Ops, LinearAttention) {
     std::memcpy(g_tensor.data(), g_data.data(), g_data.size() * sizeof(float));
     std::memcpy(init_state_tensor.data(), init_state_data.data(), init_state_data.size() * sizeof(float));
 
-    request.set_input_tensor(0, q_tensor);
-    request.set_input_tensor(1, k_tensor);
-    request.set_input_tensor(2, v_tensor);
-    request.set_input_tensor(3, beta_tensor);
-    request.set_input_tensor(4, g_tensor);
-    request.set_input_tensor(5, init_state_tensor);
+    // Bind by names because compiled-model input ordering may differ on GPU.
+    request.set_tensor("q", q_tensor);
+    request.set_tensor("k", k_tensor);
+    request.set_tensor("v", v_tensor);
+    request.set_tensor("beta", beta_tensor);
+    request.set_tensor("g", g_tensor);
+    request.set_tensor("init_state", init_state_tensor);
     request.infer();
 
     auto expected_pair = test_utils::linear_attention_ref(q_data,
