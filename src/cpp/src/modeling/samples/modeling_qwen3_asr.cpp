@@ -1011,6 +1011,20 @@ int main(int argc, char* argv[]) try {
         }
     }
 
+    ov::Tensor prompt_audio_embeds;
+    ov::Tensor prompt_audio_pos_mask;
+    ov::Tensor step_audio_embeds;
+    ov::Tensor step_audio_pos_mask;
+    if (!text_only) {
+        prompt_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, base_audio_pos_flags);
+        prompt_audio_pos_mask = make_audio_pos_mask_from_flags(base_audio_pos_flags);
+
+        std::vector<char> no_audio_flags(1, 0);
+        ov::Tensor empty_audio_embeds(ov::element::f32, ov::Shape{1, 0, embeds_shape[2]});
+        step_audio_embeds = make_audio_embeds_for_mask_positions(empty_audio_embeds, no_audio_flags);
+        step_audio_pos_mask = make_audio_pos_mask_from_flags(no_audio_flags);
+    }
+
     std::vector<int64_t> generated_ids;
     generated_ids.reserve(static_cast<size_t>(max_new_tokens));
     int64_t prev_token_id = std::numeric_limits<int64_t>::min();
@@ -1040,98 +1054,128 @@ int main(int argc, char* argv[]) try {
     size_t infer_steps = 0;
     const auto asr_infer_start = std::chrono::steady_clock::now();
 
-    for (int32_t step = 0; step < max_new_tokens; ++step) {
-        // We run full-sequence decode each step; clear internal KV state to avoid
-        // stateful-cache shape accumulation across iterations.
-        text_request.reset_state();
-
-        const size_t seq_len = input_ids.size();
-        std::vector<char> step_audio_flags = base_audio_pos_flags;
-        if (seq_len > step_audio_flags.size()) {
-            step_audio_flags.resize(seq_len, 0);
+    auto should_stop_after_push = [&](int64_t pushed_token_id) -> bool {
+        if (pushed_token_id == prev_token_id) {
+            ++same_token_run;
+        } else {
+            prev_token_id = pushed_token_id;
+            same_token_run = 1;
+        }
+        if (same_token_run >= 32) {
+            return true;
         }
 
+        if (text_only) {
+            if (has_recent_ngram_loop(generated_ids, 8, 3) || has_recent_ngram_loop(generated_ids, 12, 3)) {
+                return true;
+            }
+            if (generated_ids.size() >= 64) {
+                if (pushed_token_id == dot_token_id || pushed_token_id == excl_token_id || pushed_token_id == qmark_token_id) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // ASR outputs can get stuck in repeated phrase loops; stop early when
+        // recent n-grams are repeated to keep transcript quality stable.
+        bool repeated_loop = has_recent_ngram_loop(generated_ids, 8, 3) ||
+                             has_recent_ngram_loop(generated_ids, 12, 3) ||
+                             has_recent_ngram_loop(generated_ids, 16, 2);
+        if (!repeated_loop) {
+            // Some ASR loops are shorter (e.g., ~10-15 tokens repeated twice).
+            for (size_t n = 6; n <= 16; ++n) {
+                if (has_recent_ngram_loop(generated_ids, n, 2)) {
+                    repeated_loop = true;
+                    break;
+                }
+            }
+        }
+        return repeated_loop;
+    };
+
+    text_request.reset_state();
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
+                            make_i32({batch}, 0));
+
+    // Prefill: run full prompt once to initialize KV cache.
+    const size_t prompt_seq_len = input_ids.size();
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
+                            make_i64_from_vector(input_ids));
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
+                            make_i64({batch, prompt_seq_len}, 1));
+    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
+                            make_position_ids_3d(batch, prompt_seq_len));
+    if (!text_only) {
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
+                                prompt_audio_embeds);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
+                                prompt_audio_pos_mask);
+    }
+
+    const auto prefill_start = std::chrono::steady_clock::now();
+    text_request.infer();
+    const auto prefill_end = std::chrono::steady_clock::now();
+    ttft_ms = elapsed_ms(prefill_start, prefill_end);
+    infer_steps += 1;
+
+    size_t total_seq_len = prompt_seq_len;
+    auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
+        logits_shape = logits.get_shape();
+        const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
+        const std::string next_token_text = tokenizer.decode({next_token_id}, {ov::genai::skip_special_tokens(false)});
+        if ((eos_token_id >= 0 && next_token_id == eos_token_id) || is_text_stop_token(next_token_text)) {
+            return true;
+        }
+        generated_ids.push_back(next_token_id);
+        return should_stop_after_push(next_token_id);
+    };
+
+    bool stop_generation = false;
+    {
+        ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
+        stop_generation = process_logits_and_append(logits);
+    }
+
+    ov::Tensor one_token_ids(ov::element::i64, ov::Shape{1, 1});
+    ov::Tensor one_token_pos_ids(ov::element::i64, ov::Shape{3, 1, 1});
+    int64_t* one_token_pos_ptr = one_token_pos_ids.data<int64_t>();
+
+    while (!stop_generation && generated_ids.size() < static_cast<size_t>(max_new_tokens)) {
+        const int64_t token_to_feed = generated_ids.back();
+        one_token_ids.data<int64_t>()[0] = token_to_feed;
+
+        total_seq_len += 1;
+        const int64_t pos = static_cast<int64_t>(total_seq_len - 1);
+        one_token_pos_ptr[0] = pos;
+        one_token_pos_ptr[1] = pos;
+        one_token_pos_ptr[2] = pos;
+
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
-                                make_i64_from_vector(input_ids));
+                                one_token_ids);
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                                make_i64({batch, seq_len}, 1));
+                                make_i64({batch, total_seq_len}, 1));
         text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
-                                make_position_ids_3d(batch, seq_len));
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
-                                make_i32({batch}, 0));
+                                one_token_pos_ids);
         if (!text_only) {
-            ov::Tensor step_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, step_audio_flags);
             text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
                                     step_audio_embeds);
             text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
-                                    make_audio_pos_mask_from_flags(step_audio_flags));
+                                    step_audio_pos_mask);
         }
 
         const auto step_start = std::chrono::steady_clock::now();
         text_request.infer();
         const auto step_end = std::chrono::steady_clock::now();
-
         const double step_ms = elapsed_ms(step_start, step_end);
-        if (step == 0) {
-            ttft_ms = step_ms;
-        }
+        decode_ms += step_ms;
+        decode_tail_tokens += 1;
         infer_steps += 1;
 
         ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
-        logits_shape = logits.get_shape();
-        const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
-        const std::string next_token_text = tokenizer.decode({next_token_id}, {ov::genai::skip_special_tokens(false)});
-
-        if ((eos_token_id >= 0 && next_token_id == eos_token_id) || is_text_stop_token(next_token_text)) {
+        if (process_logits_and_append(logits)) {
+            stop_generation = true;
             break;
-        }
-
-        if (next_token_id == prev_token_id) {
-            ++same_token_run;
-        } else {
-            prev_token_id = next_token_id;
-            same_token_run = 1;
-        }
-        if (same_token_run >= 32) {
-            break;
-        }
-
-        generated_ids.push_back(next_token_id);
-        input_ids.push_back(next_token_id);
-
-        // Additional anti-degeneracy stop criteria for text-only path.
-        if (text_only) {
-            if (has_recent_ngram_loop(generated_ids, 8, 3) || has_recent_ngram_loop(generated_ids, 12, 3)) {
-                break;
-            }
-            if (generated_ids.size() >= 64) {
-                if (next_token_id == dot_token_id || next_token_id == excl_token_id || next_token_id == qmark_token_id) {
-                    break;
-                }
-            }
-        } else {
-            // ASR outputs can get stuck in repeated phrase loops; stop early when
-            // recent n-grams are repeated to keep transcript quality stable.
-            bool repeated_loop = has_recent_ngram_loop(generated_ids, 8, 3) ||
-                                 has_recent_ngram_loop(generated_ids, 12, 3) ||
-                                 has_recent_ngram_loop(generated_ids, 16, 2);
-            if (!repeated_loop) {
-                // Some ASR loops are shorter (e.g., ~10-15 tokens repeated twice).
-                for (size_t n = 6; n <= 16; ++n) {
-                    if (has_recent_ngram_loop(generated_ids, n, 2)) {
-                        repeated_loop = true;
-                        break;
-                    }
-                }
-            }
-            if (repeated_loop) {
-                break;
-            }
-        }
-
-        if (step > 0) {
-            decode_ms += step_ms;
-            decode_tail_tokens += 1;
         }
     }
     const auto asr_infer_end = std::chrono::steady_clock::now();

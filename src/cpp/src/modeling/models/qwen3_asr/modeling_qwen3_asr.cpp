@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 
+#include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
 #include <openvino/opsets/opset13.hpp>
 
@@ -360,7 +361,13 @@ std::shared_ptr<ov::Model> create_qwen3_asr_text_model(
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, Qwen3ASRTextIO::kLogits);
-    return ctx.build_model({result->output(0)});
+    auto ov_model = ctx.build_model({result->output(0)});
+
+    // Match qwen3 runtime options to reduce KV-cache bandwidth pressure during decode.
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+
+    return ov_model;
 }
 
 std::shared_ptr<ov::Model> create_qwen3_asr_audio_encoder_model(
