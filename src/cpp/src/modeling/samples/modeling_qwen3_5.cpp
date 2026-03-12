@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -44,6 +45,7 @@ struct SampleOptions {
     std::string mode;
     std::filesystem::path image_path;
     std::string user_prompt;
+    std::optional<std::filesystem::path> prompt_file;
     std::string device = "GPU";
     int max_new_tokens = 64;
     bool cache_model = false;
@@ -107,6 +109,14 @@ std::string to_lower(std::string value) {
     return value;
 }
 
+std::string read_text_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("Failed to open prompt file: " + path.string());
+    }
+    return std::string(std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
+}
+
 void print_usage(const char* argv0) {
     std::cout
         << "Qwen3.5 Modeling Sample CLI Helper\n"
@@ -132,6 +142,7 @@ void print_usage(const char* argv0) {
         << "  --image PATH                    Image path for vl mode. Required with --model --mode vl\n"
         << "                                  In dummy vl mode, if omitted, built-in 256x256 dummy image is used\n"
         << "  --prompt TEXT                   User prompt\n"
+        << "  --prompt-file PATH              Read prompt text from file\n"
         << "  --device NAME                   OpenVINO device name (default: GPU)\n"
         << "  --output-tokens N               Number of generated tokens (default: 64)\n"
         << "  --cache-model                   Enable model caching behavior.\n"
@@ -201,6 +212,8 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.image_path = take_value("--image");
         } else if (arg == "--prompt") {
             opts.user_prompt = take_value("--prompt");
+        } else if (arg == "--prompt-file") {
+            opts.prompt_file = take_value("--prompt-file");
         } else if (arg == "--device") {
             opts.device = take_value("--device");
         } else if (arg == "--output-tokens") {
@@ -235,6 +248,13 @@ SampleOptions parse_cli(int argc, char* argv[]) {
 
     if (opts.max_new_tokens <= 0) {
         throw std::runtime_error("max_new_tokens must be > 0");
+    }
+    const int prompt_sources = (!opts.user_prompt.empty() ? 1 : 0) + (opts.prompt_file.has_value() ? 1 : 0);
+    if (prompt_sources > 1) {
+        throw std::runtime_error("Use only one of --prompt or --prompt-file");
+    }
+    if (opts.prompt_file.has_value()) {
+        opts.user_prompt = read_text_file(*opts.prompt_file);
     }
     if (opts.user_prompt.empty()) {
         opts.user_prompt = (opts.mode == "vl") ? "Describe the image." : "Write one sentence about OpenVINO.";
