@@ -308,10 +308,9 @@ TEST(Ops, Moe3GemmFusedCompressed) {
     static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
     static_assert(inter_size % group_size == 0, "inter_size must be divisible by group_size");
 
-    const size_t tokens = batch * seq_len;
-    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{tokens, hidden_size});
+    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{batch, seq_len, hidden_size});
 
-    auto hidden_states = test_utils::random_f32(tokens * hidden_size, -0.5f, 0.5f, 11);
+    auto hidden_states = test_utils::random_f32(batch * seq_len * hidden_size, -0.5f, 0.5f, 11);
     auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 23);
 
     auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 31);
@@ -365,7 +364,7 @@ TEST(Ops, Moe3GemmFusedCompressed) {
     auto compiled = core.compile_model(model, "GPU");
     auto request = compiled.create_infer_request();
 
-    auto hidden_tensor = test_utils::make_tensor(hidden_states, {tokens, hidden_size});
+    auto hidden_tensor = test_utils::make_tensor(hidden_states, {batch, seq_len, hidden_size});
     request.set_input_tensor(0, hidden_tensor);
     request.infer();
 
@@ -389,9 +388,9 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
     ov::genai::modeling::BuilderContext ctx;
 
     constexpr size_t batch = 1;
-    constexpr size_t seq_len = 16;
-    constexpr size_t hidden_size = 1024;
-    constexpr size_t inter_size = 2048;
+    constexpr size_t seq_len = 8;
+    constexpr size_t hidden_size = 512;
+    constexpr size_t inter_size = 1024;
     constexpr size_t num_experts = 8;
     constexpr size_t top_k = 4;
     constexpr size_t group_size = 128;
@@ -399,10 +398,9 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
     static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
     static_assert(inter_size % group_size == 0, "inter_size must be divisible by group_size");
 
-    const size_t tokens = batch * seq_len;
-    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{tokens, hidden_size});
+    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{batch, seq_len, hidden_size});
 
-    auto hidden_states = test_utils::random_f32(tokens * hidden_size, -0.5f, 0.5f, 11);
+    auto hidden_states = test_utils::random_f32(batch * seq_len * hidden_size, -0.5f, 0.5f, 11);
     auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 23);
     
     auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 31);
@@ -459,7 +457,7 @@ TEST(Ops, Moe3GemmFusedCompressedwithInt4RouterWeights) {
 
     ov::serialize(compiled.get_runtime_model(), "Moe3GemmFusedCompressed_compiled.xml");
 
-    auto hidden_tensor = test_utils::make_tensor(hidden_states, {tokens, hidden_size});
+    auto hidden_tensor = test_utils::make_tensor(hidden_states, {batch, seq_len, hidden_size});
     request.set_input_tensor(0, hidden_tensor);
     request.infer();
     
