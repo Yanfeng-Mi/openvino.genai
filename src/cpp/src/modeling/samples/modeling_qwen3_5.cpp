@@ -13,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -56,9 +57,15 @@ struct SampleOptions {
     std::optional<int> num_layers;
     int max_pixels = 0;
 
-    float repetition_penalty = 1.1f;
-    float frequency_penalty = 0.1f;
-    float presence_penalty = 0.0f;
+    // Sampling parameters – defaults follow Qwen3.5 official recommendations
+    // for "thinking mode, general tasks".
+    float temperature = 1.0f;
+    float top_p = 0.95f;
+    size_t top_k = 20;
+    float repetition_penalty = 1.0f;
+    float frequency_penalty = 0.0f;
+    float presence_penalty = 1.5f;
+    size_t rng_seed = 0;  // 0 = use random_device
 };
 
 bool has_safetensors_file(const std::filesystem::path& model_dir) {
@@ -170,9 +177,13 @@ void print_usage(const char* argv0) {
     << "  --num-layers N                  Run only the first N text transformer layers (dummy + real model)\n"
     << "  --max-pixels N                  Limit vision input to N pixels (default: from preprocessor_config.json)\n"
     << "                                  Recommended: 602112 (3072 tokens * 14^2 patch) for ARL-H GPU\n"
-    << "  --repetition-penalty FLOAT      Penalty for repeating tokens (default: 1.0, >1 discourages repetition)\n"
-    << "  --frequency-penalty FLOAT       Subtract penalty * token_count from logit each step (default: 0.0)\n"
-    << "  --presence-penalty FLOAT        Subtract penalty from logit if token appeared at all (default: 0.0)\n"
+    << "  --temperature FLOAT             Sampling temperature (default: 1.0, 0 = greedy argmax)\n"
+    << "  --top-p FLOAT                   Nucleus sampling threshold (default: 0.95)\n"
+    << "  --top-k INT                     Top-K filtering (default: 20)\n"
+    << "  --repetition-penalty FLOAT      Penalty for repeating tokens (default: 1.0)\n"
+    << "  --frequency-penalty FLOAT       Subtract penalty * token_count from logit (default: 0.0)\n"
+    << "  --presence-penalty FLOAT        Subtract penalty if token appeared (default: 1.5)\n"
+    << "  --rng-seed INT                  Random seed for sampling (default: 0 = random)\n"
         << "  -h, --help                      Show this helper\n";
 }
 
@@ -242,12 +253,20 @@ SampleOptions parse_cli(int argc, char* argv[]) {
             opts.num_layers = parse_i32(take_value("--num-layers"), "--num-layers");
         } else if (arg == "--max-pixels") {
             opts.max_pixels = parse_i32(take_value("--max-pixels"), "--max-pixels");
+        } else if (arg == "--temperature") {
+            opts.temperature = parse_float(take_value("--temperature"), "--temperature");
+        } else if (arg == "--top-p") {
+            opts.top_p = parse_float(take_value("--top-p"), "--top-p");
+        } else if (arg == "--top-k") {
+            opts.top_k = static_cast<size_t>(parse_i32(take_value("--top-k"), "--top-k"));
         } else if (arg == "--repetition-penalty") {
             opts.repetition_penalty = parse_float(take_value("--repetition-penalty"), "--repetition-penalty");
         } else if (arg == "--frequency-penalty") {
             opts.frequency_penalty = parse_float(take_value("--frequency-penalty"), "--frequency-penalty");
         } else if (arg == "--presence-penalty") {
             opts.presence_penalty = parse_float(take_value("--presence-penalty"), "--presence-penalty");
+        } else if (arg == "--rng-seed") {
+            opts.rng_seed = static_cast<size_t>(parse_i32(take_value("--rng-seed"), "--rng-seed"));
         } else {
             throw std::runtime_error("Unknown option: " + arg);
         }
@@ -377,6 +396,27 @@ void extract_last_logits_f32(const ov::Tensor& logits, std::vector<float>& out) 
 
 int64_t argmax_f32(const std::vector<float>& data) {
     return static_cast<int64_t>(std::max_element(data.begin(), data.end()) - data.begin());
+}
+
+// Multinomial sampling from processed logits.
+// After LogitProcessor::apply(), if temperature > 0, the Logits object contains
+// softmax probabilities (from TemperatureLogitTransform) and may have been filtered
+// by TopP/TopK (stored in lw.m_vector).  We sample from that distribution.
+int64_t sample_multinomial(ov::genai::Logits& lw, std::mt19937& rng) {
+    if (lw.is_vector_initialized()) {
+        // TopP / TopK was applied – m_vector holds the filtered (prob, index) pairs.
+        std::vector<float> weights;
+        weights.reserve(lw.m_vector.size());
+        for (size_t i = 0; i < lw.m_size; ++i) {
+            weights.push_back(std::max(lw.m_vector[i].m_log_prob, 0.0f));
+        }
+        std::discrete_distribution<size_t> dist(weights.begin(), weights.end());
+        size_t picked = dist(rng);
+        return lw.m_vector[picked].m_index;
+    }
+    // No TopP/TopK – m_data holds full vocab probabilities.
+    std::discrete_distribution<size_t> dist(lw.m_data, lw.m_data + lw.m_size);
+    return static_cast<int64_t>(dist(rng));
 }
 
 ov::Tensor make_beam_idx(size_t batch) {
@@ -881,12 +921,21 @@ int main(int argc, char* argv[]) try {
     }
 
     // Build GenerationConfig for LogitProcessor from CLI options.
+    const bool use_sampling = opts.temperature > 0.0f;
     ov::genai::GenerationConfig gen_config;
-    gen_config.do_sample = false;
+    gen_config.do_sample = use_sampling;
+    gen_config.temperature = opts.temperature;
+    gen_config.top_p = opts.top_p;
+    gen_config.top_k = opts.top_k;
     gen_config.repetition_penalty = opts.repetition_penalty;
     gen_config.frequency_penalty = opts.frequency_penalty;
     gen_config.presence_penalty = opts.presence_penalty;
     ov::genai::LogitProcessor logit_processor(gen_config, prompt_token_ids);
+
+    // RNG for multinomial sampling.
+    std::mt19937 rng(opts.rng_seed != 0
+                     ? static_cast<std::mt19937::result_type>(opts.rng_seed)
+                     : std::random_device{}());
 
     // Reusable float32 scratch buffer for logit processing across all decode steps.
     std::vector<float> logit_buf;
@@ -898,11 +947,12 @@ int main(int argc, char* argv[]) try {
 
     // Process prefill logits and select first token.
     extract_last_logits_f32(logits, logit_buf);
+    int64_t next_id;
     {
         ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
         logit_processor.apply(lw);
+        next_id = use_sampling ? sample_multinomial(lw, rng) : argmax_f32(logit_buf);
     }
-    int64_t next_id = argmax_f32(logit_buf);
     logit_processor.register_new_generated_token(next_id);
     logit_processor.update_generated_len(1);
 
@@ -1001,8 +1051,8 @@ int main(int argc, char* argv[]) try {
         {
             ov::genai::Logits lw(logit_buf.data(), logit_buf.size());
             logit_processor.apply(lw);
+            next_id = use_sampling ? sample_multinomial(lw, rng) : argmax_f32(logit_buf);
         }
-        next_id = argmax_f32(logit_buf);
         logit_processor.register_new_generated_token(next_id);
         generated.push_back(next_id);
         logit_processor.update_generated_len(generated.size());
