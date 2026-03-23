@@ -16,6 +16,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,20 +67,50 @@ double elapsed_ms(const std::chrono::steady_clock::time_point& start,
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct StreamingConfig {
+    bool enabled = false;
+    double chunk_sec = 1.0;
+    double window_sec = 15.0;
+    int32_t unfixed_chunk_num = 3;
+    int32_t unfixed_token_num = 5;
+};
+
+struct ASRDecodePassResult {
+    ov::Shape embeds_shape;
+    ov::Shape logits_shape;
+    std::vector<int64_t> generated_ids;
+    std::string transcript_text;
+    std::string language_tag;
+    int64_t audio_output_length = 0;
+    size_t prompt_token_size = 0;
+    size_t audio_seq_len = 0;
+    double audio_encode_ms = 0.0;
+    double ttft_ms = 0.0;
+    double decode_ms = 0.0;
+    size_t decode_tail_tokens = 0;
+    size_t infer_steps = 0;
+};
+
 void print_usage(const char* argv0) {
     std::cout
         << "Qwen3-ASR modeling sample\n"
         << "Usage:\n"
         << "  " << argv0
-        << " <TEXT_MODEL_DIR> [AUDIO_MODEL_DIR] [DEVICE] [--wav <AUDIO.wav>] [--device <DEVICE>] [--max_new_tokens <N>] [--text-only] [--prompt <TEXT>]\n\n"
+        << " <TEXT_MODEL_DIR> [AUDIO_MODEL_DIR] [DEVICE] [--wav <AUDIO.wav>] [--device <DEVICE>] [--max_new_tokens <N>] [--text-only] [--prompt <TEXT>] [--streaming] [--stream_chunk_sec <S>] [--stream_window_sec <S>] [--stream_unfixed_chunk_num <N>] [--stream_unfixed_token_num <K>]\n\n"
         << "Examples:\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR/text C:/models/Qwen3-ASR/audio GPU\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --wav C:/audio/test.wav --device GPU --max_new_tokens 128\n"
+        << "  " << argv0 << " C:/models/Qwen3-ASR --wav C:/audio/test.wav --streaming --stream_chunk_sec 2.0 --stream_window_sec 24.0\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --text-only --prompt \"Summarize this sentence.\" --device GPU\n"
         << "  " << argv0 << " C:/models/Qwen3-ASR --cached-model\n\n"
         << "Options:\n"
-        << "  --cached-model (or --cache-model)  Serialize built IR to model directory before inference\n\n"
+        << "  --cached-model (or --cache-model)  Serialize built IR to model directory before inference\n"
+        << "  --streaming                         Enable chunked streaming ASR mode\n"
+        << "  --stream_chunk_sec <S>              Seconds of new audio consumed per chunk (default: 1.0)\n"
+        << "  --stream_window_sec <S>             Seconds kept in the sliding audio window after warmup (default: 15.0)\n"
+        << "  --stream_unfixed_chunk_num <N>      Number of warmup chunks before using the fixed window (default: 3)\n"
+        << "  --stream_unfixed_token_num <K>      Number of trailing words kept provisional between chunks (default: 5)\n\n"
         << "In-flight quantization (optional, env-based):\n"
         << "  OV_GENAI_INFLIGHT_QUANT_MODE\n"
         << "  OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE\n"
@@ -336,6 +367,39 @@ ov::Tensor make_audio_features(size_t batch, size_t mel_bins, size_t frames) {
     return t;
 }
 
+ov::Tensor make_audio_features_from_pcm(const std::vector<float>& raw,
+                                        ov::genai::WhisperFeatureExtractor& extractor,
+                                        size_t expected_mel_bins) {
+    if (raw.empty()) {
+        throw std::runtime_error("Input audio slice has no samples");
+    }
+
+    ov::genai::WhisperFeatures features = extractor.extract(raw);
+    if (features.n_frames == 0 || features.feature_size == 0) {
+        throw std::runtime_error("Failed to extract audio features from input samples");
+    }
+
+    const size_t actual_mel_bins = features.feature_size;
+    const size_t frames = features.n_frames;
+    const size_t mel_bins = expected_mel_bins > 0 ? expected_mel_bins : actual_mel_bins;
+
+    ov::Tensor tensor(ov::element::f32, ov::Shape{1, mel_bins, frames});
+    float* dst = tensor.data<float>();
+    const float* src = features.data.data();
+
+    for (size_t m = 0; m < mel_bins; ++m) {
+        const float* src_row = (m < actual_mel_bins) ? (src + m * frames) : nullptr;
+        float* dst_row = dst + m * frames;
+        if (src_row != nullptr) {
+            std::copy(src_row, src_row + frames, dst_row);
+        } else {
+            std::fill(dst_row, dst_row + frames, 0.0f);
+        }
+    }
+
+    return tensor;
+}
+
 ov::Tensor make_audio_features_from_wav(const std::filesystem::path& wav_path,
                                         const std::filesystem::path& preprocessor_json,
                                         size_t expected_mel_bins,
@@ -378,6 +442,29 @@ ov::Tensor make_audio_features_from_wav(const std::filesystem::path& wav_path,
     }
 
     return tensor;
+}
+
+ov::Tensor slice_audio_feature_window(const ov::Tensor& features, size_t start_frame, size_t end_frame) {
+    const auto shape = features.get_shape();
+    if (shape.size() != 3 || shape[0] != 1 || features.get_element_type() != ov::element::f32) {
+        throw std::runtime_error("Expected audio features shape [1, mel, frames] with f32 type");
+    }
+    if (start_frame > end_frame || end_frame > shape[2]) {
+        throw std::runtime_error("Invalid audio feature frame slice");
+    }
+
+    const size_t mel_bins = shape[1];
+    const size_t frame_count = end_frame - start_frame;
+    ov::Tensor out(ov::element::f32, ov::Shape{1, mel_bins, frame_count});
+
+    const float* src = features.data<const float>();
+    float* dst = out.data<float>();
+    for (size_t mel = 0; mel < mel_bins; ++mel) {
+        const float* src_row = src + mel * shape[2] + start_frame;
+        float* dst_row = dst + mel * frame_count;
+        std::copy(src_row, src_row + frame_count, dst_row);
+    }
+    return out;
 }
 
 ov::Tensor make_position_ids_3d(size_t batch, size_t seq_len) {
@@ -698,6 +785,621 @@ std::string normalize_language_name(const std::string& raw) {
     return out;
 }
 
+bool is_suspicious_short_tail_word(const std::string& normalized_word) {
+    static const std::unordered_set<std::string> suspicious_short_tail_words = {
+        "a", "an", "the", "and", "but", "or", "so", "because", "if", "when", "while",
+        "of", "to", "for", "in", "on", "at", "with", "from", "by", "as",
+        "he", "she", "it", "they", "we", "i", "you", "his", "her", "their", "our", "your",
+        "hmm", "hm", "mm", "uh", "um", "ah", "oh", "yeah", "ya"};
+    return suspicious_short_tail_words.find(normalized_word) != suspicious_short_tail_words.end();
+}
+
+bool is_connector_tail_word(const std::string& normalized_word) {
+    static const std::unordered_set<std::string> connector_tail_words = {
+        "a", "an", "the", "and", "but", "or", "so", "because", "if", "when", "while",
+        "of", "to", "for", "in", "on", "at", "with", "from", "by", "as"};
+    return connector_tail_words.find(normalized_word) != connector_tail_words.end();
+}
+
+bool has_suspicious_connector_boundary(const std::vector<std::string>& base_words,
+                                       const std::vector<std::string>& candidate_words,
+                                       size_t overlap_words) {
+    if (base_words.empty() || overlap_words >= candidate_words.size()) {
+        return false;
+    }
+
+    auto normalize_boundary_word = [](const std::string& raw_word) {
+        std::string out;
+        out.reserve(raw_word.size());
+        for (unsigned char c : raw_word) {
+            if (std::isalnum(c)) {
+                out.push_back(static_cast<char>(std::tolower(c)));
+            }
+        }
+        return out;
+    };
+
+    const std::string left = normalize_boundary_word(base_words.back());
+    const std::string right = normalize_boundary_word(candidate_words[overlap_words]);
+    if (left.empty() || right.empty()) {
+        return false;
+    }
+    if (!is_connector_tail_word(left) || !is_connector_tail_word(right)) {
+        return false;
+    }
+    if (left == right) {
+        return true;
+    }
+
+    static const std::unordered_set<std::string> hard_connector_boundary_words = {
+        "and", "but", "or", "so", "because", "if", "when", "while", "of", "to", "for", "with", "from", "by", "as"};
+    return hard_connector_boundary_words.find(left) != hard_connector_boundary_words.end() ||
+           hard_connector_boundary_words.find(right) != hard_connector_boundary_words.end();
+}
+
+bool is_ascii_alpha_word(const std::string& word) {
+    if (word.empty()) {
+        return false;
+    }
+    for (char c : word) {
+        if (!std::isalpha(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string normalize_word_for_matching(const std::string& raw_word) {
+    std::string out;
+    out.reserve(raw_word.size());
+    for (unsigned char c : raw_word) {
+        if (c < 0x80 && std::isalnum(c)) {
+            out.push_back(static_cast<char>(std::tolower(c)));
+        } else if (c >= 0x80) {
+            out.push_back(static_cast<char>(c));
+        }
+    }
+    return out;
+}
+
+std::string normalize_text_for_comparison(const std::string& raw_text) {
+    static const std::array<std::string, 3> utf8_punctuation = {
+        "\xE3\x80\x82", "\xEF\xBC\x81", "\xEF\xBC\x9F"};
+
+    std::string out;
+    out.reserve(raw_text.size());
+    for (size_t idx = 0; idx < raw_text.size();) {
+        bool skipped_utf8_punctuation = false;
+        for (const auto& token : utf8_punctuation) {
+            if (raw_text.compare(idx, token.size(), token) == 0) {
+                idx += token.size();
+                skipped_utf8_punctuation = true;
+                break;
+            }
+        }
+        if (skipped_utf8_punctuation) {
+            continue;
+        }
+
+        const unsigned char c = static_cast<unsigned char>(raw_text[idx]);
+        if (c < 0x80) {
+            if (std::isalnum(c)) {
+                out.push_back(static_cast<char>(std::tolower(c)));
+            }
+            ++idx;
+            continue;
+        }
+
+        out.push_back(static_cast<char>(c));
+        ++idx;
+    }
+    return out;
+}
+
+size_t utf8_codepoint_count(const std::string& text) {
+    size_t count = 0;
+    for (unsigned char c : text) {
+        if ((c & 0xC0) != 0x80) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+uint32_t decode_utf8_codepoint(const std::string& text, size_t offset, size_t& width) {
+    const unsigned char lead = static_cast<unsigned char>(text[offset]);
+    if ((lead & 0x80) == 0) {
+        width = 1;
+        return lead;
+    }
+    if ((lead & 0xE0) == 0xC0 && offset + 1 < text.size()) {
+        width = 2;
+        return ((lead & 0x1F) << 6) |
+               (static_cast<unsigned char>(text[offset + 1]) & 0x3F);
+    }
+    if ((lead & 0xF0) == 0xE0 && offset + 2 < text.size()) {
+        width = 3;
+        return ((lead & 0x0F) << 12) |
+               ((static_cast<unsigned char>(text[offset + 1]) & 0x3F) << 6) |
+               (static_cast<unsigned char>(text[offset + 2]) & 0x3F);
+    }
+    if ((lead & 0xF8) == 0xF0 && offset + 3 < text.size()) {
+        width = 4;
+        return ((lead & 0x07) << 18) |
+               ((static_cast<unsigned char>(text[offset + 1]) & 0x3F) << 12) |
+               ((static_cast<unsigned char>(text[offset + 2]) & 0x3F) << 6) |
+               (static_cast<unsigned char>(text[offset + 3]) & 0x3F);
+    }
+    width = 1;
+    return lead;
+}
+
+bool is_cjk_codepoint(uint32_t cp) {
+    return (cp >= 0x3400 && cp <= 0x4DBF) ||
+           (cp >= 0x4E00 && cp <= 0x9FFF) ||
+           (cp >= 0xF900 && cp <= 0xFAFF);
+}
+
+bool is_cjk_punctuation_codepoint(uint32_t cp) {
+    return (cp >= 0x3000 && cp <= 0x303F) ||
+           (cp >= 0xFF00 && cp <= 0xFFEF);
+}
+
+bool is_cyrillic_codepoint(uint32_t cp) {
+    return (cp >= 0x0400 && cp <= 0x052F) ||
+           (cp >= 0x2DE0 && cp <= 0x2DFF) ||
+           (cp >= 0xA640 && cp <= 0xA69F);
+}
+
+bool ends_with(const std::string& text, const std::string& suffix) {
+    return text.size() >= suffix.size() && text.compare(text.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string strip_sentence_terminal_punctuation(const std::string& sentence) {
+    static const std::array<std::string, 6> sentence_delimiters = {
+        ".", "!", "?", "\xE3\x80\x82", "\xEF\xBC\x81", "\xEF\xBC\x9F"};
+    std::string out = trim_copy(sentence);
+    for (const auto& delimiter : sentence_delimiters) {
+        if (ends_with(out, delimiter)) {
+            out.resize(out.size() - delimiter.size());
+            return trim_copy(out);
+        }
+    }
+    return out;
+}
+
+std::string last_normalized_word(const std::string& text) {
+    std::istringstream stream(text);
+    std::string word;
+    std::string last;
+    while (stream >> word) {
+        const std::string normalized = normalize_word_for_matching(word);
+        if (!normalized.empty()) {
+            last = normalized;
+        }
+    }
+    return last;
+}
+
+bool starts_with_ascii_lower_word(const std::string& text) {
+    for (unsigned char c : text) {
+        if (std::isspace(c)) {
+            continue;
+        }
+        return std::islower(c) != 0;
+    }
+    return false;
+}
+
+std::vector<std::string> split_terminated_sentences(const std::string& text) {
+    static const std::array<std::string, 6> sentence_delimiters = {
+        ".", "!", "?", "\xE3\x80\x82", "\xEF\xBC\x81", "\xEF\xBC\x9F"};
+    std::vector<std::string> sentences;
+    size_t sentence_start = 0;
+    size_t pos = 0;
+    while (pos < text.size()) {
+        size_t matched_len = 0;
+        for (const auto& delimiter : sentence_delimiters) {
+            if (text.compare(pos, delimiter.size(), delimiter) == 0) {
+                matched_len = delimiter.size();
+                break;
+            }
+        }
+        if (matched_len == 0) {
+            ++pos;
+            continue;
+        }
+        const size_t sentence_end = pos + matched_len;
+        std::string sentence = trim_copy(text.substr(sentence_start, sentence_end - sentence_start));
+        if (!sentence.empty()) {
+            sentences.push_back(sentence);
+        }
+        sentence_start = sentence_end;
+        pos = sentence_end;
+    }
+    if (!trim_copy(text.substr(sentence_start)).empty()) {
+        sentences.push_back(trim_copy(text.substr(sentence_start)));
+    }
+    return sentences;
+}
+
+std::string maybe_merge_broken_sentence_boundaries(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return text;
+    }
+
+    std::vector<std::string> sentences = split_terminated_sentences(text);
+    if (sentences.size() < 2) {
+        return text;
+    }
+
+    std::vector<std::string> merged;
+    merged.push_back(sentences.front());
+    for (size_t idx = 1; idx < sentences.size(); ++idx) {
+        std::string current = trim_copy(sentences[idx]);
+        std::string previous_core = strip_sentence_terminal_punctuation(merged.back());
+        std::string current_core = strip_sentence_terminal_punctuation(current);
+        const std::string previous_last_word = last_normalized_word(previous_core);
+
+        const bool should_merge = starts_with_ascii_lower_word(current_core) ||
+                      is_connector_tail_word(previous_last_word);
+        if (should_merge) {
+            merged.back() = trim_copy(previous_core + " " + current);
+        } else {
+            merged.push_back(current);
+        }
+    }
+
+    std::string out;
+    for (size_t idx = 0; idx < merged.size(); ++idx) {
+        if (idx > 0) {
+            out += ' ';
+        }
+        out += trim_copy(merged[idx]);
+    }
+    return trim_copy(out);
+}
+
+std::string maybe_trim_repeated_filler_tail(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return text;
+    }
+
+    std::vector<std::string> sentences = split_terminated_sentences(text);
+    if (sentences.size() < 3) {
+        return text;
+    }
+
+    const std::string tail_sentence = sentences.back();
+    const std::string tail_core = strip_sentence_terminal_punctuation(tail_sentence);
+    if (tail_core.empty()) {
+        return text;
+    }
+
+    const size_t tail_codepoints = utf8_codepoint_count(tail_core);
+    const std::string normalized_tail = normalize_word_for_matching(tail_core);
+    if (tail_codepoints != 1 && !is_suspicious_short_tail_word(normalized_tail)) {
+        return text;
+    }
+
+    size_t repeat_count = 1;
+    for (size_t idx = sentences.size() - 1; idx > 0; --idx) {
+        if (normalize_word_for_matching(strip_sentence_terminal_punctuation(sentences[idx - 1])) != normalized_tail) {
+            break;
+        }
+        ++repeat_count;
+    }
+    if (repeat_count < 3) {
+        return text;
+    }
+
+    sentences.resize(sentences.size() - repeat_count);
+    std::string out;
+    for (const auto& sentence : sentences) {
+        out += sentence;
+    }
+    return trim_copy(out);
+}
+
+std::string maybe_trim_trailing_fragment_sentence(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return text;
+    }
+
+    size_t sentence_end = text.find_last_of(".!?");
+    if (sentence_end == std::string::npos || sentence_end + 1 != text.size()) {
+        return text;
+    }
+
+    size_t sentence_start = text.find_last_of(".!?", sentence_end > 0 ? sentence_end - 1 : 0);
+    sentence_start = (sentence_start == std::string::npos) ? 0 : sentence_start + 1;
+    std::string tail = trim_copy(text.substr(sentence_start, sentence_end - sentence_start));
+    if (tail.empty()) {
+        return text;
+    }
+
+    std::istringstream stream(tail);
+    std::vector<std::string> words;
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    if (words.size() != 1) {
+        return text;
+    }
+
+    std::string lower = words.front();
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    if (!is_ascii_alpha_word(lower) || !is_suspicious_short_tail_word(lower)) {
+        return text;
+    }
+
+    if (sentence_start == 0) {
+        return text;
+    }
+    return trim_copy(text.substr(0, sentence_start));
+}
+
+std::string maybe_trim_repeated_tail_words(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return text;
+    }
+
+    std::istringstream stream(text);
+    std::vector<std::string> words;
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    if (words.size() < 4) {
+        return text;
+    }
+
+    const std::string tail_word = normalize_word_for_matching(words.back());
+    if (tail_word.empty() || !is_suspicious_short_tail_word(tail_word)) {
+        return text;
+    }
+
+    size_t repeat_count = 1;
+    for (size_t idx = words.size() - 1; idx > 0; --idx) {
+        if (normalize_word_for_matching(words[idx - 1]) != tail_word) {
+            break;
+        }
+        ++repeat_count;
+    }
+    if (repeat_count < 3 || words.size() == repeat_count) {
+        return text;
+    }
+
+    words.resize(words.size() - repeat_count);
+    std::string out;
+    for (size_t idx = 0; idx < words.size(); ++idx) {
+        if (idx > 0) {
+            out += ' ';
+        }
+        out += words[idx];
+    }
+    return out;
+}
+
+std::string maybe_collapse_malformed_connector_pairs(const std::string& raw_text) {
+    std::string text = trim_copy(raw_text);
+    if (text.empty()) {
+        return text;
+    }
+
+    std::istringstream stream(text);
+    std::vector<std::string> words;
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    if (words.size() < 2) {
+        return text;
+    }
+
+    static const std::unordered_set<std::string> malformed_pairs = {
+        "but and", "and but", "or and", "and or", "but or", "or but", "so and", "and so"};
+
+    std::vector<std::string> cleaned;
+    cleaned.reserve(words.size());
+    for (size_t idx = 0; idx < words.size(); ++idx) {
+        if (idx + 1 < words.size()) {
+            const std::string left = normalize_word_for_matching(words[idx]);
+            const std::string right = normalize_word_for_matching(words[idx + 1]);
+            if (malformed_pairs.find(left + " " + right) != malformed_pairs.end()) {
+                cleaned.push_back(words[idx]);
+                ++idx;
+                continue;
+            }
+        }
+        cleaned.push_back(words[idx]);
+    }
+
+    std::string out;
+    for (size_t idx = 0; idx < cleaned.size(); ++idx) {
+        if (idx > 0) {
+            out += ' ';
+        }
+        out += cleaned[idx];
+    }
+    return out;
+}
+
+std::string sanitize_chinese_transcript_text(const std::string& raw_text) {
+    std::string stripped;
+    stripped.reserve(raw_text.size());
+    for (size_t idx = 0; idx < raw_text.size();) {
+        size_t width = 0;
+        const uint32_t cp = decode_utf8_codepoint(raw_text, idx, width);
+        if (cp < 0x80 && std::isalpha(static_cast<unsigned char>(cp))) {
+            idx += width;
+            while (idx < raw_text.size()) {
+                size_t inner_width = 0;
+                const uint32_t inner_cp = decode_utf8_codepoint(raw_text, idx, inner_width);
+                if (inner_cp < 0x80 && std::isalpha(static_cast<unsigned char>(inner_cp))) {
+                    idx += inner_width;
+                    continue;
+                }
+                break;
+            }
+            while (idx < raw_text.size() && std::isspace(static_cast<unsigned char>(raw_text[idx]))) {
+                ++idx;
+            }
+            continue;
+        }
+        if (is_cyrillic_codepoint(cp)) {
+            idx += width;
+            while (idx < raw_text.size()) {
+                size_t inner_width = 0;
+                const uint32_t inner_cp = decode_utf8_codepoint(raw_text, idx, inner_width);
+                if (is_cyrillic_codepoint(inner_cp)) {
+                    idx += inner_width;
+                    continue;
+                }
+                break;
+            }
+            while (idx < raw_text.size() && std::isspace(static_cast<unsigned char>(raw_text[idx]))) {
+                ++idx;
+            }
+            continue;
+        }
+        stripped.append(raw_text, idx, width);
+        idx += width;
+    }
+
+    std::string compact;
+    compact.reserve(stripped.size());
+    for (size_t idx = 0; idx < stripped.size();) {
+        size_t width = 0;
+        const uint32_t cp = decode_utf8_codepoint(stripped, idx, width);
+        if (cp < 0x80 && std::isspace(static_cast<unsigned char>(cp))) {
+            size_t next_idx = idx + width;
+            while (next_idx < stripped.size() && std::isspace(static_cast<unsigned char>(stripped[next_idx]))) {
+                ++next_idx;
+            }
+
+            bool drop_space = false;
+            if (!compact.empty() && next_idx < stripped.size()) {
+                size_t prev_width = 0;
+                size_t prev_offset = compact.size();
+                do {
+                    --prev_offset;
+                } while (prev_offset > 0 && (static_cast<unsigned char>(compact[prev_offset]) & 0xC0) == 0x80);
+                const uint32_t prev_cp = decode_utf8_codepoint(compact, prev_offset, prev_width);
+
+                size_t next_width = 0;
+                const uint32_t next_cp = decode_utf8_codepoint(stripped, next_idx, next_width);
+                const bool prev_cjkish = is_cjk_codepoint(prev_cp) || is_cjk_punctuation_codepoint(prev_cp);
+                const bool next_cjkish = is_cjk_codepoint(next_cp) || is_cjk_punctuation_codepoint(next_cp);
+                drop_space = prev_cjkish || next_cjkish;
+            }
+
+            if (!drop_space && !compact.empty() && compact.back() != ' ') {
+                compact.push_back(' ');
+            }
+            idx = next_idx;
+            continue;
+        }
+
+        compact.append(stripped, idx, width);
+        idx += width;
+    }
+
+    std::vector<std::string> sentences = split_terminated_sentences(trim_copy(compact));
+    if (sentences.size() >= 2) {
+        std::vector<std::string> filtered;
+        for (size_t idx = 0; idx < sentences.size(); ++idx) {
+            const std::string current_norm = normalize_text_for_comparison(strip_sentence_terminal_punctuation(sentences[idx]));
+            if (idx + 1 < sentences.size()) {
+                const std::string next_norm = normalize_text_for_comparison(strip_sentence_terminal_punctuation(sentences[idx + 1]));
+                if (!current_norm.empty() &&
+                    next_norm.size() > current_norm.size() &&
+                    next_norm.rfind(current_norm, 0) == 0) {
+                    continue;
+                }
+            }
+            filtered.push_back(sentences[idx]);
+        }
+
+        std::string rebuilt;
+        for (const auto& sentence : filtered) {
+            rebuilt += trim_copy(sentence);
+        }
+        compact = rebuilt;
+    }
+
+    return trim_copy(compact);
+}
+
+std::string sanitize_english_transcript_text(const std::string& raw_text) {
+    std::string stripped;
+    stripped.reserve(raw_text.size());
+    for (size_t idx = 0; idx < raw_text.size();) {
+        size_t width = 0;
+        const uint32_t cp = decode_utf8_codepoint(raw_text, idx, width);
+        if (is_cjk_codepoint(cp) || is_cjk_punctuation_codepoint(cp) || is_cyrillic_codepoint(cp)) {
+            idx += width;
+            while (idx < raw_text.size()) {
+                size_t inner_width = 0;
+                const uint32_t inner_cp = decode_utf8_codepoint(raw_text, idx, inner_width);
+                if (is_cjk_codepoint(inner_cp) || is_cjk_punctuation_codepoint(inner_cp) || is_cyrillic_codepoint(inner_cp)) {
+                    idx += inner_width;
+                    continue;
+                }
+                break;
+            }
+            while (idx < raw_text.size() && std::isspace(static_cast<unsigned char>(raw_text[idx]))) {
+                ++idx;
+            }
+            continue;
+        }
+        stripped.append(raw_text, idx, width);
+        idx += width;
+    }
+
+    std::string compact = trim_copy(stripped);
+    while (!compact.empty()) {
+        unsigned char c = static_cast<unsigned char>(compact.front());
+        if (std::isalnum(c) || c == '"' || c == '\'') {
+            break;
+        }
+        compact.erase(compact.begin());
+        compact = trim_copy(compact);
+    }
+
+    for (size_t idx = 0; idx + 1 < compact.size(); ++idx) {
+        const unsigned char next = static_cast<unsigned char>(compact[idx + 1]);
+        if ((compact[idx] == '.' || compact[idx] == '!' || compact[idx] == '?') && std::isspace(next)) {
+            size_t next_idx = idx + 1;
+            while (next_idx < compact.size() && std::isspace(static_cast<unsigned char>(compact[next_idx]))) {
+                ++next_idx;
+            }
+            if (next_idx < compact.size() && std::islower(static_cast<unsigned char>(compact[next_idx]))) {
+                compact[next_idx] = static_cast<char>(std::toupper(static_cast<unsigned char>(compact[next_idx])));
+            }
+        }
+    }
+
+    return trim_copy(compact);
+}
+
+std::string postprocess_transcript_for_language(const std::string& raw_text, const std::string& language_tag) {
+    if (language_tag == "Chinese") {
+        return sanitize_chinese_transcript_text(raw_text);
+    }
+    if (language_tag == "English") {
+        return sanitize_english_transcript_text(raw_text);
+    }
+    return trim_copy(raw_text);
+}
+
 std::string clean_transcript_text(const std::string& raw_text) {
     std::string out = raw_text;
     const std::array<std::string, 6> control_tokens = {
@@ -713,7 +1415,131 @@ std::string clean_transcript_text(const std::string& raw_text) {
                              out.front() == '!' || out.front() == '?' || std::isspace(static_cast<unsigned char>(out.front())))) {
         out.erase(out.begin());
     }
+    out = trim_copy(out);
+    while (true) {
+        const std::string previous = out;
+        out = maybe_merge_broken_sentence_boundaries(out);
+        out = maybe_collapse_malformed_connector_pairs(out);
+        out = maybe_trim_repeated_filler_tail(out);
+        out = maybe_trim_trailing_fragment_sentence(out);
+        out = maybe_trim_repeated_tail_words(out);
+        out = trim_copy(out);
+        if (out == previous) {
+            break;
+        }
+    }
     return trim_copy(out);
+}
+
+std::vector<std::string> split_words(const std::string& text) {
+    std::istringstream stream(text);
+    std::vector<std::string> words;
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    return words;
+}
+
+std::string join_words(const std::vector<std::string>& words) {
+    std::string out;
+    for (size_t i = 0; i < words.size(); ++i) {
+        if (i > 0) {
+            out += ' ';
+        }
+        out += words[i];
+    }
+    return out;
+}
+
+size_t suffix_prefix_word_overlap(const std::vector<std::string>& left,
+                                  const std::vector<std::string>& right,
+                                  size_t max_words) {
+    const size_t limit = std::min({left.size(), right.size(), max_words});
+    for (size_t overlap = limit; overlap > 0; --overlap) {
+        bool same = true;
+        const size_t left_base = left.size() - overlap;
+        for (size_t i = 0; i < overlap; ++i) {
+            if (normalize_word_for_matching(left[left_base + i]) != normalize_word_for_matching(right[i])) {
+                same = false;
+                break;
+            }
+        }
+        if (same) {
+            return overlap;
+        }
+    }
+    return 0;
+}
+
+double repeated_word_ratio(const std::vector<std::string>& words) {
+    if (words.empty()) {
+        return 0.0;
+    }
+    std::unordered_set<std::string> unique(words.begin(), words.end());
+    return 1.0 - (static_cast<double>(unique.size()) / static_cast<double>(words.size()));
+}
+
+std::vector<std::string> concat_words(const std::vector<std::string>& prefix,
+                                      const std::vector<std::string>& suffix) {
+    std::vector<std::string> out = prefix;
+    out.insert(out.end(), suffix.begin(), suffix.end());
+    return out;
+}
+
+std::string tail_words_text(const std::vector<std::string>& words, size_t max_words) {
+    if (words.size() <= max_words) {
+        return join_words(words);
+    }
+    return join_words(std::vector<std::string>(words.end() - static_cast<std::ptrdiff_t>(max_words), words.end()));
+}
+
+bool should_accept_streaming_candidate(const std::vector<std::string>& current_words,
+                                       const std::vector<std::string>& base_words,
+                                       const std::vector<std::string>& candidate_words,
+                                       const std::vector<std::string>& merged_words,
+                                       int32_t rollback_words,
+                                       size_t overlap_words) {
+    if (candidate_words.empty()) {
+        return false;
+    }
+    if (candidate_words.size() >= 16 && repeated_word_ratio(candidate_words) > 0.45) {
+        return false;
+    }
+    const size_t allowed_shrink = static_cast<size_t>(std::max<int32_t>(8, rollback_words * 2));
+    if (!current_words.empty() && merged_words.size() + allowed_shrink < current_words.size()) {
+        return false;
+    }
+    if (!current_words.empty()) {
+        const size_t min_expected_overlap = static_cast<size_t>(std::max<int32_t>(2, rollback_words / 2));
+        const size_t duplicate_growth = merged_words.size() > current_words.size() ? (merged_words.size() - current_words.size()) : 0;
+        const size_t suspicious_growth = static_cast<size_t>(std::max<int32_t>(16, rollback_words * 3));
+        if (overlap_words < min_expected_overlap && duplicate_growth > suspicious_growth) {
+            return false;
+        }
+    }
+    if (has_suspicious_connector_boundary(base_words, candidate_words, overlap_words)) {
+        return false;
+    }
+    return true;
+}
+
+int32_t compute_streaming_decode_cap(size_t audio_seq_len, int32_t max_new_tokens) {
+    const int32_t heuristic_cap = static_cast<int32_t>(std::max<size_t>(64, audio_seq_len / 2));
+    return std::min(max_new_tokens, heuristic_cap);
+}
+
+std::string build_asr_instruction_prompt(bool text_only,
+                                         const std::optional<std::string>& prompt_override,
+                                         const std::string& transcript_prefix = {}) {
+    if (text_only) {
+        return prompt_override.value_or("Please answer briefly: hello.");
+    }
+    if (transcript_prefix.empty()) {
+        return "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.<|im_end|>\n<|im_start|>assistant\n";
+    }
+    return "<|im_start|>user\nPrevious confirmed transcript:\n" + transcript_prefix +
+           "\nContinue transcribing the following audio.\n<|audio_start|><|audio_pad|><|audio_end|><|im_end|>\n<|im_start|>assistant\n";
 }
 
 std::string extract_language_from_prefix(std::string& text) {
@@ -742,6 +1568,7 @@ int main(int argc, char* argv[]) try {
     std::optional<std::string> device_override;
     std::optional<int32_t> max_new_tokens_override;
     std::optional<std::string> prompt_override;
+    StreamingConfig streaming_cfg;
     bool text_only = false;
     bool cache_model = false;
 
@@ -767,6 +1594,28 @@ int main(int argc, char* argv[]) try {
                 throw std::runtime_error("Missing value for --prompt");
             }
             prompt_override = std::string(argv[++i]);
+        } else if (arg == "--streaming") {
+            streaming_cfg.enabled = true;
+        } else if (arg == "--stream_chunk_sec") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_chunk_sec");
+            }
+            streaming_cfg.chunk_sec = std::stod(argv[++i]);
+        } else if (arg == "--stream_window_sec") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_window_sec");
+            }
+            streaming_cfg.window_sec = std::stod(argv[++i]);
+        } else if (arg == "--stream_unfixed_chunk_num") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_unfixed_chunk_num");
+            }
+            streaming_cfg.unfixed_chunk_num = std::stoi(argv[++i]);
+        } else if (arg == "--stream_unfixed_token_num") {
+            if (i + 1 >= argc) {
+                throw std::runtime_error("Missing value for --stream_unfixed_token_num");
+            }
+            streaming_cfg.unfixed_token_num = std::stoi(argv[++i]);
         } else if (arg == "--text-only" || arg == "--text_only") {
             text_only = true;
         } else if (arg == "--cached-model" || arg == "--cache-model") {
@@ -795,6 +1644,21 @@ int main(int argc, char* argv[]) try {
     if (max_new_tokens <= 0) {
         throw std::runtime_error("--max_new_tokens must be > 0");
     }
+    if (streaming_cfg.enabled && text_only) {
+        throw std::runtime_error("--streaming is only supported for audio transcription mode");
+    }
+    if (streaming_cfg.chunk_sec <= 0.0) {
+        throw std::runtime_error("--stream_chunk_sec must be > 0");
+    }
+    if (streaming_cfg.window_sec < streaming_cfg.chunk_sec) {
+        throw std::runtime_error("--stream_window_sec must be >= --stream_chunk_sec");
+    }
+    if (streaming_cfg.unfixed_chunk_num < 0) {
+        throw std::runtime_error("--stream_unfixed_chunk_num must be >= 0");
+    }
+    if (streaming_cfg.unfixed_token_num < 0) {
+        throw std::runtime_error("--stream_unfixed_token_num must be >= 0");
+    }
 
     const auto text_loader_cfg = ov::genai::loaders::ModelConfig::from_hf_json(text_model_dir / "config.json");
     const auto audio_loader_cfg = text_only ? text_loader_cfg
@@ -816,9 +1680,9 @@ int main(int argc, char* argv[]) try {
     const std::filesystem::path audio_bin = audio_model_dir / "modeling_qwen3_asr_audio.bin";
 
     auto quant_cfg = ov::genai::modeling::weights::parse_quantization_config_from_env();
-    if (quant_cfg.enabled() && quant_cfg.group_size <= 0) {
+    if (quant_cfg.enabled() && quant_cfg.group_size < -1) {
         throw std::runtime_error(
-            "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > 0 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
+            "OV_GENAI_INFLIGHT_QUANT_GROUP_SIZE must be > -1 when OV_GENAI_INFLIGHT_QUANT_MODE is enabled");
     }
     std::cout << "[quant] enabled=" << (quant_cfg.enabled() ? "true" : "false")
               << ", group_size=" << quant_cfg.group_size << std::endl;
@@ -899,59 +1763,35 @@ int main(int argc, char* argv[]) try {
     const size_t batch = 1;
     const size_t mel_bins = static_cast<size_t>(std::max(1, audio_cfg.num_mel_bins));
     ov::Tensor input_audio_features;
+    std::optional<ov::genai::WhisperFeatureExtractor> feature_extractor;
+    std::vector<float> input_audio_samples;
     double input_audio_duration_seconds = 0.0;
     uint32_t input_audio_sample_rate = 0;
+    std::filesystem::path preprocessor_cfg;
     const auto feature_extract_start = std::chrono::steady_clock::now();
     if (!text_only) {
         if (wav_path.has_value()) {
-            std::filesystem::path preprocessor_cfg = audio_model_dir / "preprocessor_config.json";
+            preprocessor_cfg = audio_model_dir / "preprocessor_config.json";
             if (!std::filesystem::exists(preprocessor_cfg)) {
                 preprocessor_cfg = text_model_dir / "preprocessor_config.json";
             }
-            input_audio_features = make_audio_features_from_wav(*wav_path,
-                                                                preprocessor_cfg,
-                                                                mel_bins,
-                                                                &input_audio_duration_seconds,
-                                                                &input_audio_sample_rate);
+            feature_extractor.emplace(preprocessor_cfg);
+            input_audio_sample_rate = static_cast<uint32_t>(std::max<size_t>(1, feature_extractor->sampling_rate));
+            input_audio_samples = read_wav_pcm_mono_or_stereo(*wav_path, input_audio_sample_rate);
+            if (input_audio_samples.empty()) {
+                throw std::runtime_error("Input wav has no audio samples: " + wav_path->string());
+            }
+            input_audio_duration_seconds = static_cast<double>(input_audio_samples.size()) /
+                                           static_cast<double>(input_audio_sample_rate);
+            if (!streaming_cfg.enabled) {
+                input_audio_features = make_audio_features_from_pcm(input_audio_samples, *feature_extractor, mel_bins);
+            }
         } else {
             input_audio_features = make_audio_features(batch, mel_bins, 300);
             input_audio_duration_seconds = static_cast<double>(input_audio_features.get_shape()[2]) / 100.0;
         }
     }
     const auto feature_extract_end = std::chrono::steady_clock::now();
-
-    const auto audio_encode_start = std::chrono::steady_clock::now();
-    ov::Tensor audio_embeds;
-    ov::Tensor audio_out_lengths;
-    ov::Shape embeds_shape;
-    size_t audio_seq_len = 0;
-    if (!text_only) {
-        const size_t audio_frames = input_audio_features.get_shape()[2];
-
-        audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kInputAudioFeatures, input_audio_features);
-
-        auto input_lengths = make_i64({batch});
-        input_lengths.data<int64_t>()[0] = static_cast<int64_t>(audio_frames);
-        audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioFeatureLengths, input_lengths);
-
-        audio_request->infer();
-        audio_embeds = audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioEmbeds);
-        audio_out_lengths =
-            audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioOutputLengths);
-
-        embeds_shape = audio_embeds.get_shape();
-        if (embeds_shape.size() != 3) {
-            throw std::runtime_error("Audio encoder output rank must be 3");
-        }
-
-        audio_seq_len = embeds_shape[1];
-        const size_t embed_dim = embeds_shape[2];
-
-        if (embed_dim != static_cast<size_t>(text_cfg.hidden_size)) {
-            throw std::runtime_error("audio_embeds hidden dimension does not match text hidden_size");
-        }
-    }
-    const auto audio_encode_end = std::chrono::steady_clock::now();
 
     ov::genai::Tokenizer tokenizer(text_model_dir, ov::AnyMap{{"fix_mistral_regex", true}});
     const auto vocab = tokenizer.get_vocab();
@@ -965,69 +1805,6 @@ int main(int argc, char* argv[]) try {
     if (bos_token_id < 0) {
         bos_token_id = eos_token_id >= 0 ? eos_token_id : 1;
     }
-
-    std::string instruction_prompt;
-    if (text_only) {
-        instruction_prompt = prompt_override.value_or("Please answer briefly: hello.");
-    } else {
-        // Approximate the Python processor instruction path:
-        // <|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.
-        instruction_prompt =
-            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>Transcribe this audio.<|im_end|>\n<|im_start|>assistant\n";
-    }
-    auto encoded_prompt = tokenizer.encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
-    std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
-
-    std::vector<int64_t> input_ids;
-    input_ids.reserve(prompt_ids.size() + audio_seq_len + static_cast<size_t>(max_new_tokens));
-    if (text_only) {
-        input_ids = prompt_ids;
-        if (input_ids.empty()) {
-            input_ids.push_back(bos_token_id);
-        }
-    } else {
-        bool replaced_audio_placeholder = false;
-        for (int64_t tid : prompt_ids) {
-            if (!replaced_audio_placeholder && tid == audio_pad_token_id) {
-                input_ids.insert(input_ids.end(), audio_seq_len, audio_pad_token_id);
-                replaced_audio_placeholder = true;
-            } else {
-                input_ids.push_back(tid);
-            }
-        }
-        if (!replaced_audio_placeholder) {
-            // Fallback: if template/prompt changed, keep sample functional.
-            input_ids.insert(input_ids.begin(), audio_seq_len, audio_pad_token_id);
-            input_ids.push_back(bos_token_id);
-        }
-    }
-    const size_t prompt_token_size = input_ids.size();
-
-    std::vector<char> base_audio_pos_flags(input_ids.size(), 0);
-    for (size_t i = 0; i < input_ids.size(); ++i) {
-        if (input_ids[i] == audio_pad_token_id) {
-            base_audio_pos_flags[i] = 1;
-        }
-    }
-
-    ov::Tensor prompt_audio_embeds;
-    ov::Tensor prompt_audio_pos_mask;
-    ov::Tensor step_audio_embeds;
-    ov::Tensor step_audio_pos_mask;
-    if (!text_only) {
-        prompt_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, base_audio_pos_flags);
-        prompt_audio_pos_mask = make_audio_pos_mask_from_flags(base_audio_pos_flags);
-
-        std::vector<char> no_audio_flags(1, 0);
-        ov::Tensor empty_audio_embeds(ov::element::f32, ov::Shape{1, 0, embeds_shape[2]});
-        step_audio_embeds = make_audio_embeds_for_mask_positions(empty_audio_embeds, no_audio_flags);
-        step_audio_pos_mask = make_audio_pos_mask_from_flags(no_audio_flags);
-    }
-
-    std::vector<int64_t> generated_ids;
-    generated_ids.reserve(static_cast<size_t>(max_new_tokens));
-    int64_t prev_token_id = std::numeric_limits<int64_t>::min();
-    int32_t same_token_run = 0;
 
     std::unordered_set<int64_t> excluded_decode_ids;
     add_token_if_found(vocab, "<|audio_pad|>", excluded_decode_ids);
@@ -1050,226 +1827,522 @@ int main(int argc, char* argv[]) try {
     add_token_if_found(vocab, "<|endoftext|>", stop_token_ids);
     add_token_if_found(vocab, "<|im_end|>", stop_token_ids);
     add_token_if_found(vocab, "<|eot_id|>", stop_token_ids);
+    auto run_asr_decode_pass = [&](const ov::Tensor& pass_audio_features,
+                                   int32_t requested_max_new_tokens,
+                                   const std::string& transcript_prefix,
+                                   bool dynamic_decode_cap) -> ASRDecodePassResult {
+        ASRDecodePassResult result;
+        ov::Tensor audio_embeds;
+        ov::Tensor audio_out_lengths;
+        size_t audio_seq_len = 0;
+        int32_t pass_max_new_tokens = requested_max_new_tokens;
 
-    ov::Shape logits_shape;
+        if (!text_only) {
+            const auto audio_encode_start = std::chrono::steady_clock::now();
+            const size_t audio_frames = pass_audio_features.get_shape()[2];
+
+            audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kInputAudioFeatures, pass_audio_features);
+            auto input_lengths = make_i64({batch});
+            input_lengths.data<int64_t>()[0] = static_cast<int64_t>(audio_frames);
+            audio_request->set_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioFeatureLengths, input_lengths);
+            audio_request->infer();
+            const auto audio_encode_end = std::chrono::steady_clock::now();
+            result.audio_encode_ms = elapsed_ms(audio_encode_start, audio_encode_end);
+
+            audio_embeds = audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioEmbeds);
+            audio_out_lengths = audio_request->get_tensor(ov::genai::modeling::models::Qwen3ASRAudioIO::kAudioOutputLengths);
+            result.embeds_shape = audio_embeds.get_shape();
+            if (result.embeds_shape.size() != 3) {
+                throw std::runtime_error("Audio encoder output rank must be 3");
+            }
+            audio_seq_len = result.embeds_shape[1];
+            result.audio_seq_len = audio_seq_len;
+            result.audio_output_length = audio_out_lengths.data<const int64_t>()[0];
+
+            const size_t embed_dim = result.embeds_shape[2];
+            if (embed_dim != static_cast<size_t>(text_cfg.hidden_size)) {
+                throw std::runtime_error("audio_embeds hidden dimension does not match text hidden_size");
+            }
+            if (dynamic_decode_cap) {
+                pass_max_new_tokens = compute_streaming_decode_cap(audio_seq_len, requested_max_new_tokens);
+            }
+        }
+
+        std::string instruction_prompt = build_asr_instruction_prompt(text_only, prompt_override, transcript_prefix);
+        auto encoded_prompt = tokenizer.encode(instruction_prompt, {ov::genai::add_special_tokens(false)});
+        std::vector<int64_t> prompt_ids = tensor_row_to_i64_vector(encoded_prompt.input_ids);
+
+        std::vector<int64_t> input_ids;
+        input_ids.reserve(prompt_ids.size() + audio_seq_len + static_cast<size_t>(pass_max_new_tokens));
+        if (text_only) {
+            input_ids = prompt_ids;
+            if (input_ids.empty()) {
+                input_ids.push_back(bos_token_id);
+            }
+        } else {
+            bool replaced_audio_placeholder = false;
+            for (int64_t tid : prompt_ids) {
+                if (!replaced_audio_placeholder && tid == audio_pad_token_id) {
+                    input_ids.insert(input_ids.end(), audio_seq_len, audio_pad_token_id);
+                    replaced_audio_placeholder = true;
+                } else {
+                    input_ids.push_back(tid);
+                }
+            }
+            if (!replaced_audio_placeholder) {
+                input_ids.insert(input_ids.begin(), audio_seq_len, audio_pad_token_id);
+                input_ids.push_back(bos_token_id);
+            }
+        }
+        result.prompt_token_size = input_ids.size();
+
+        std::vector<char> base_audio_pos_flags(input_ids.size(), 0);
+        for (size_t i = 0; i < input_ids.size(); ++i) {
+            if (input_ids[i] == audio_pad_token_id) {
+                base_audio_pos_flags[i] = 1;
+            }
+        }
+
+        ov::Tensor prompt_audio_embeds;
+        ov::Tensor prompt_audio_pos_mask;
+        ov::Tensor step_audio_embeds;
+        ov::Tensor step_audio_pos_mask;
+        if (!text_only) {
+            prompt_audio_embeds = make_audio_embeds_for_mask_positions(audio_embeds, base_audio_pos_flags);
+            prompt_audio_pos_mask = make_audio_pos_mask_from_flags(base_audio_pos_flags);
+
+            std::vector<char> no_audio_flags(1, 0);
+            ov::Tensor empty_audio_embeds(ov::element::f32, ov::Shape{1, 0, result.embeds_shape[2]});
+            step_audio_embeds = make_audio_embeds_for_mask_positions(empty_audio_embeds, no_audio_flags);
+            step_audio_pos_mask = make_audio_pos_mask_from_flags(no_audio_flags);
+        }
+
+        std::vector<int64_t> generated_ids;
+        generated_ids.reserve(static_cast<size_t>(pass_max_new_tokens));
+        int64_t prev_token_id = std::numeric_limits<int64_t>::min();
+        int32_t same_token_run = 0;
+
+        auto should_stop_after_push = [&](int64_t pushed_token_id) -> bool {
+            if (pushed_token_id == prev_token_id) {
+                ++same_token_run;
+            } else {
+                prev_token_id = pushed_token_id;
+                same_token_run = 1;
+            }
+            if (same_token_run >= 32) {
+                return true;
+            }
+
+            if (text_only) {
+                if (has_recent_ngram_loop(generated_ids, 8, 3) || has_recent_ngram_loop(generated_ids, 12, 3)) {
+                    return true;
+                }
+                if (generated_ids.size() >= 64) {
+                    if (pushed_token_id == dot_token_id || pushed_token_id == excl_token_id || pushed_token_id == qmark_token_id) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            bool repeated_loop = has_recent_ngram_loop(generated_ids, 8, 3) ||
+                                 has_recent_ngram_loop(generated_ids, 12, 3) ||
+                                 has_recent_ngram_loop(generated_ids, 16, 2);
+            if (!repeated_loop) {
+                for (size_t n = 6; n <= 16; ++n) {
+                    if (has_recent_ngram_loop(generated_ids, n, 2)) {
+                        repeated_loop = true;
+                        break;
+                    }
+                }
+            }
+            return repeated_loop;
+        };
+
+        text_request.reset_state();
+        ov::Tensor beam_idx = make_i32({batch}, 0);
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx, beam_idx);
+
+        const size_t max_total_seq_len = result.prompt_token_size + static_cast<size_t>(pass_max_new_tokens);
+        std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
+        auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
+            if (seq_len == 0 || seq_len > max_total_seq_len) {
+                throw std::runtime_error("Invalid seq_len for attention mask view");
+            }
+            return ov::Tensor(ov::element::i64, ov::Shape{batch, seq_len}, attention_mask_storage.data());
+        };
+
+        const size_t prompt_seq_len = input_ids.size();
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds, make_i64_from_vector(input_ids));
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask, make_attention_mask_view(prompt_seq_len));
+        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds, make_position_ids_3d(batch, prompt_seq_len));
+        if (!text_only) {
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, prompt_audio_embeds);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, prompt_audio_pos_mask);
+        }
+
+        const auto prefill_start = std::chrono::steady_clock::now();
+        text_request.infer();
+        const auto prefill_end = std::chrono::steady_clock::now();
+        result.ttft_ms = elapsed_ms(prefill_start, prefill_end);
+        result.infer_steps += 1;
+
+        size_t total_seq_len = prompt_seq_len;
+        auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
+            result.logits_shape = logits.get_shape();
+            const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
+            if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
+                (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
+                return true;
+            }
+            generated_ids.push_back(next_token_id);
+            return should_stop_after_push(next_token_id);
+        };
+
+        bool stop_generation = false;
+        {
+            ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
+            stop_generation = process_logits_and_append(logits);
+        }
+
+        ov::Tensor one_token_ids(ov::element::i64, ov::Shape{1, 1});
+        ov::Tensor one_token_pos_ids(ov::element::i64, ov::Shape{3, 1, 1});
+        int64_t* one_token_pos_ptr = one_token_pos_ids.data<int64_t>();
+
+        while (!stop_generation && generated_ids.size() < static_cast<size_t>(pass_max_new_tokens)) {
+            const int64_t token_to_feed = generated_ids.back();
+            one_token_ids.data<int64_t>()[0] = token_to_feed;
+
+            total_seq_len += 1;
+            const int64_t pos = static_cast<int64_t>(total_seq_len - 1);
+            one_token_pos_ptr[0] = pos;
+            one_token_pos_ptr[1] = pos;
+            one_token_pos_ptr[2] = pos;
+
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds, one_token_ids);
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask, make_attention_mask_view(total_seq_len));
+            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds, one_token_pos_ids);
+            if (!text_only) {
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds, step_audio_embeds);
+                text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask, step_audio_pos_mask);
+            }
+
+            const auto step_start = std::chrono::steady_clock::now();
+            text_request.infer();
+            const auto step_end = std::chrono::steady_clock::now();
+            result.decode_ms += elapsed_ms(step_start, step_end);
+            result.decode_tail_tokens += 1;
+            result.infer_steps += 1;
+
+            ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
+            if (process_logits_and_append(logits)) {
+                stop_generation = true;
+                break;
+            }
+        }
+
+        if (!text_only) {
+            while (trim_recent_duplicate_ngram(generated_ids, 6, 16)) {
+            }
+        }
+
+        result.generated_ids = generated_ids;
+        if (!generated_ids.empty()) {
+            result.transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(true)});
+        }
+        result.transcript_text = clean_transcript_text(result.transcript_text);
+
+        result.language_tag = detect_language_from_tokens(tokenizer, generated_ids);
+        const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, generated_ids);
+        if (!language_from_tokens.empty()) {
+            result.language_tag = language_from_tokens;
+        }
+
+        std::string cleaned = result.transcript_text;
+        const std::string language_from_text = extract_language_from_prefix(cleaned);
+        if (!language_from_text.empty()) {
+            if (result.language_tag.empty() || result.language_tag == "unknown") {
+                result.language_tag = language_from_text;
+            }
+            result.transcript_text = cleaned;
+        }
+        if (text_only && result.language_tag == "unknown") {
+            result.language_tag = "n/a";
+        }
+        result.transcript_text = postprocess_transcript_for_language(result.transcript_text, result.language_tag);
+        return result;
+    };
+
+    double feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
+    double audio_encode_ms = 0.0;
     double ttft_ms = 0.0;
     double decode_ms = 0.0;
     size_t decode_tail_tokens = 0;
     size_t infer_steps = 0;
-    const auto asr_infer_start = std::chrono::steady_clock::now();
-
-    auto should_stop_after_push = [&](int64_t pushed_token_id) -> bool {
-        if (pushed_token_id == prev_token_id) {
-            ++same_token_run;
-        } else {
-            prev_token_id = pushed_token_id;
-            same_token_run = 1;
-        }
-        if (same_token_run >= 32) {
-            return true;
-        }
-
-        if (text_only) {
-            if (has_recent_ngram_loop(generated_ids, 8, 3) || has_recent_ngram_loop(generated_ids, 12, 3)) {
-                return true;
-            }
-            if (generated_ids.size() >= 64) {
-                if (pushed_token_id == dot_token_id || pushed_token_id == excl_token_id || pushed_token_id == qmark_token_id) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // ASR outputs can get stuck in repeated phrase loops; stop early when
-        // recent n-grams are repeated to keep transcript quality stable.
-        bool repeated_loop = has_recent_ngram_loop(generated_ids, 8, 3) ||
-                             has_recent_ngram_loop(generated_ids, 12, 3) ||
-                             has_recent_ngram_loop(generated_ids, 16, 2);
-        if (!repeated_loop) {
-            // Some ASR loops are shorter (e.g., ~10-15 tokens repeated twice).
-            for (size_t n = 6; n <= 16; ++n) {
-                if (has_recent_ngram_loop(generated_ids, n, 2)) {
-                    repeated_loop = true;
-                    break;
-                }
-            }
-        }
-        return repeated_loop;
-    };
-
-    text_request.reset_state();
-    ov::Tensor beam_idx = make_i32({batch}, 0);
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kBeamIdx,
-                            beam_idx);
-
-    const size_t max_total_seq_len = prompt_token_size + static_cast<size_t>(max_new_tokens);
-    std::vector<int64_t> attention_mask_storage(max_total_seq_len, 1);
-    auto make_attention_mask_view = [&](size_t seq_len) -> ov::Tensor {
-        if (seq_len == 0 || seq_len > max_total_seq_len) {
-            throw std::runtime_error("Invalid seq_len for attention mask view");
-        }
-        return ov::Tensor(ov::element::i64,
-                          ov::Shape{batch, seq_len},
-                          attention_mask_storage.data());
-    };
-
-    // Prefill: run full prompt once to initialize KV cache.
-    const size_t prompt_seq_len = input_ids.size();
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
-                            make_i64_from_vector(input_ids));
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                            make_attention_mask_view(prompt_seq_len));
-    text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
-                            make_position_ids_3d(batch, prompt_seq_len));
-    if (!text_only) {
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
-                                prompt_audio_embeds);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
-                                prompt_audio_pos_mask);
-    }
-
-    const auto prefill_start = std::chrono::steady_clock::now();
-    text_request.infer();
-    const auto prefill_end = std::chrono::steady_clock::now();
-    ttft_ms = elapsed_ms(prefill_start, prefill_end);
-    infer_steps += 1;
-
-    size_t total_seq_len = prompt_seq_len;
-    auto process_logits_and_append = [&](const ov::Tensor& logits) -> bool {
-        logits_shape = logits.get_shape();
-        const int64_t next_token_id = argmax_last_token_id_excluding(logits, excluded_decode_ids);
-        if ((eos_token_id >= 0 && next_token_id == eos_token_id) ||
-            (stop_token_ids.find(next_token_id) != stop_token_ids.end())) {
-            return true;
-        }
-        generated_ids.push_back(next_token_id);
-        return should_stop_after_push(next_token_id);
-    };
-
-    bool stop_generation = false;
-    {
-        ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
-        stop_generation = process_logits_and_append(logits);
-    }
-
-    ov::Tensor one_token_ids(ov::element::i64, ov::Shape{1, 1});
-    ov::Tensor one_token_pos_ids(ov::element::i64, ov::Shape{3, 1, 1});
-    int64_t* one_token_pos_ptr = one_token_pos_ids.data<int64_t>();
-
-    while (!stop_generation && generated_ids.size() < static_cast<size_t>(max_new_tokens)) {
-        const int64_t token_to_feed = generated_ids.back();
-        one_token_ids.data<int64_t>()[0] = token_to_feed;
-
-        total_seq_len += 1;
-        const int64_t pos = static_cast<int64_t>(total_seq_len - 1);
-        one_token_pos_ptr[0] = pos;
-        one_token_pos_ptr[1] = pos;
-        one_token_pos_ptr[2] = pos;
-
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kInputIds,
-                                one_token_ids);
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAttentionMask,
-                                make_attention_mask_view(total_seq_len));
-        text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kPositionIds,
-                                one_token_pos_ids);
-        if (!text_only) {
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioEmbeds,
-                                    step_audio_embeds);
-            text_request.set_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kAudioPosMask,
-                                    step_audio_pos_mask);
-        }
-
-        const auto step_start = std::chrono::steady_clock::now();
-        text_request.infer();
-        const auto step_end = std::chrono::steady_clock::now();
-        const double step_ms = elapsed_ms(step_start, step_end);
-        decode_ms += step_ms;
-        decode_tail_tokens += 1;
-        infer_steps += 1;
-
-        ov::Tensor logits = text_request.get_tensor(ov::genai::modeling::models::Qwen3ASRTextIO::kLogits);
-        if (process_logits_and_append(logits)) {
-            stop_generation = true;
-            break;
-        }
-    }
-    const auto asr_infer_end = std::chrono::steady_clock::now();
-
-    if (!text_only) {
-        // If we stopped right after closing a duplicated tail, keep only one copy.
-        while (trim_recent_duplicate_ngram(generated_ids, 6, 16)) {
-        }
-    }
-
+    double asr_infer_ms = 0.0;
+    size_t prompt_token_size = 0;
+    ov::Shape logits_shape;
+    ASRDecodePassResult final_pass;
     std::string transcript_text;
-    if (!generated_ids.empty()) {
-        transcript_text = tokenizer.decode(generated_ids, {ov::genai::skip_special_tokens(true)});
-    }
-    transcript_text = clean_transcript_text(transcript_text);
+    std::string language_tag = text_only ? "n/a" : "unknown";
+    size_t streaming_chunk_count = 0;
 
-    std::string language_tag = detect_language_from_tokens(tokenizer, generated_ids);
-    const std::string language_from_tokens = detect_language_from_language_prefix_tokens(tokenizer, generated_ids);
-    if (!language_from_tokens.empty()) {
-        language_tag = language_from_tokens;
-    }
-    if (language_tag == "unknown") {
-        const std::string language_from_text = extract_language_from_prefix(transcript_text);
-        if (!language_from_text.empty()) {
-            language_tag = language_from_text;
+    if (streaming_cfg.enabled) {
+        std::vector<std::string> confirmed_words;
+        std::vector<std::string> provisional_words;
+        std::vector<std::string> current_words;
+
+        if (wav_path.has_value()) {
+            const size_t chunk_samples = std::max<size_t>(1, static_cast<size_t>(std::llround(streaming_cfg.chunk_sec * input_audio_sample_rate)));
+            const size_t window_samples = std::max<size_t>(chunk_samples, static_cast<size_t>(std::llround(streaming_cfg.window_sec * input_audio_sample_rate)));
+            streaming_chunk_count = (input_audio_samples.size() + chunk_samples - 1) / chunk_samples;
+
+            for (size_t chunk_idx = 0; chunk_idx < streaming_chunk_count; ++chunk_idx) {
+                const size_t chunk_end = std::min(input_audio_samples.size(), (chunk_idx + 1) * chunk_samples);
+                const size_t chunk_start = (chunk_idx < static_cast<size_t>(streaming_cfg.unfixed_chunk_num))
+                    ? 0
+                    : (chunk_end > window_samples ? chunk_end - window_samples : 0);
+                std::vector<float> chunk_audio(input_audio_samples.begin() + static_cast<std::ptrdiff_t>(chunk_start),
+                                              input_audio_samples.begin() + static_cast<std::ptrdiff_t>(chunk_end));
+
+                const auto chunk_feature_start = std::chrono::steady_clock::now();
+                ov::Tensor chunk_features = make_audio_features_from_pcm(chunk_audio, *feature_extractor, mel_bins);
+                const auto chunk_feature_end = std::chrono::steady_clock::now();
+                feature_extract_ms += elapsed_ms(chunk_feature_start, chunk_feature_end);
+
+                ASRDecodePassResult pass = run_asr_decode_pass(chunk_features,
+                                                               max_new_tokens,
+                                                               tail_words_text(confirmed_words, 64),
+                                                               true);
+                final_pass = pass;
+                if ((language_tag.empty() || language_tag == "unknown") &&
+                    !pass.language_tag.empty() && pass.language_tag != "unknown") {
+                    language_tag = pass.language_tag;
+                }
+                audio_encode_ms += pass.audio_encode_ms;
+                if (chunk_idx == 0) {
+                    ttft_ms = pass.ttft_ms;
+                }
+                decode_ms += pass.decode_ms;
+                decode_tail_tokens += pass.decode_tail_tokens;
+                infer_steps += pass.infer_steps;
+                asr_infer_ms += pass.ttft_ms + pass.decode_ms;
+                prompt_token_size = pass.prompt_token_size;
+                logits_shape = pass.logits_shape;
+
+                auto candidate_words = split_words(pass.transcript_text);
+                auto base_words = concat_words(confirmed_words, provisional_words);
+                const std::string normalized_base_text = normalize_text_for_comparison(join_words(base_words));
+                const std::string normalized_candidate_text = normalize_text_for_comparison(join_words(candidate_words));
+                size_t overlap = 0;
+                std::vector<std::string> merged_words;
+                if (!normalized_base_text.empty() &&
+                    normalized_candidate_text.size() > normalized_base_text.size() &&
+                    normalized_candidate_text.rfind(normalized_base_text, 0) == 0) {
+                    overlap = base_words.size();
+                    merged_words = candidate_words;
+                } else {
+                    overlap = suffix_prefix_word_overlap(base_words,
+                                                         candidate_words,
+                                                         static_cast<size_t>(std::max<int32_t>(16, streaming_cfg.unfixed_token_num * 8)));
+                    merged_words = base_words;
+                    merged_words.insert(merged_words.end(), candidate_words.begin() + static_cast<std::ptrdiff_t>(overlap), candidate_words.end());
+                }
+
+                if (should_accept_streaming_candidate(current_words,
+                                                     base_words,
+                                                     candidate_words,
+                                                     merged_words,
+                                                     streaming_cfg.unfixed_token_num,
+                                                     overlap)) {
+                    const int32_t rollback_words = (chunk_idx < static_cast<size_t>(streaming_cfg.unfixed_chunk_num))
+                        ? static_cast<int32_t>(merged_words.size())
+                        : streaming_cfg.unfixed_token_num;
+                    if (merged_words.size() > static_cast<size_t>(rollback_words)) {
+                        confirmed_words.assign(merged_words.begin(), merged_words.end() - rollback_words);
+                        provisional_words.assign(merged_words.end() - rollback_words, merged_words.end());
+                    } else {
+                        confirmed_words.clear();
+                        provisional_words = merged_words;
+                    }
+                    current_words = merged_words;
+                    transcript_text = join_words(current_words);
+                    if (!pass.language_tag.empty() && pass.language_tag != "unknown") {
+                        language_tag = pass.language_tag;
+                    }
+                }
+
+                const double window_start_sec = static_cast<double>(chunk_start) / static_cast<double>(input_audio_sample_rate);
+                const double window_end_sec = static_cast<double>(chunk_end) / static_cast<double>(input_audio_sample_rate);
+                std::cout << "[stream] chunk " << (chunk_idx + 1) << "/" << streaming_chunk_count
+                          << " window_s=[" << std::fixed << std::setprecision(2) << window_start_sec << ", " << window_end_sec << "]"
+                          << " text=" << transcript_text << std::endl;
+            }
+        } else {
+            const size_t total_frames = input_audio_features.get_shape()[2];
+            const size_t chunk_frames = std::max<size_t>(1, static_cast<size_t>(std::llround(streaming_cfg.chunk_sec * 100.0)));
+            const size_t window_frames = std::max<size_t>(chunk_frames, static_cast<size_t>(std::llround(streaming_cfg.window_sec * 100.0)));
+            streaming_chunk_count = (total_frames + chunk_frames - 1) / chunk_frames;
+
+            for (size_t chunk_idx = 0; chunk_idx < streaming_chunk_count; ++chunk_idx) {
+                const size_t chunk_end = std::min(total_frames, (chunk_idx + 1) * chunk_frames);
+                const size_t chunk_start = (chunk_idx < static_cast<size_t>(streaming_cfg.unfixed_chunk_num))
+                    ? 0
+                    : (chunk_end > window_frames ? chunk_end - window_frames : 0);
+
+                const auto chunk_feature_start = std::chrono::steady_clock::now();
+                ov::Tensor chunk_features = slice_audio_feature_window(input_audio_features, chunk_start, chunk_end);
+                const auto chunk_feature_end = std::chrono::steady_clock::now();
+                feature_extract_ms += elapsed_ms(chunk_feature_start, chunk_feature_end);
+
+                ASRDecodePassResult pass = run_asr_decode_pass(chunk_features,
+                                                               max_new_tokens,
+                                                               tail_words_text(confirmed_words, 64),
+                                                               true);
+                final_pass = pass;
+                if ((language_tag.empty() || language_tag == "unknown") &&
+                    !pass.language_tag.empty() && pass.language_tag != "unknown") {
+                    language_tag = pass.language_tag;
+                }
+                audio_encode_ms += pass.audio_encode_ms;
+                if (chunk_idx == 0) {
+                    ttft_ms = pass.ttft_ms;
+                }
+                decode_ms += pass.decode_ms;
+                decode_tail_tokens += pass.decode_tail_tokens;
+                infer_steps += pass.infer_steps;
+                asr_infer_ms += pass.ttft_ms + pass.decode_ms;
+                prompt_token_size = pass.prompt_token_size;
+                logits_shape = pass.logits_shape;
+
+                auto candidate_words = split_words(pass.transcript_text);
+                auto base_words = concat_words(confirmed_words, provisional_words);
+                const std::string normalized_base_text = normalize_text_for_comparison(join_words(base_words));
+                const std::string normalized_candidate_text = normalize_text_for_comparison(join_words(candidate_words));
+                size_t overlap = 0;
+                std::vector<std::string> merged_words;
+                if (!normalized_base_text.empty() &&
+                    normalized_candidate_text.size() > normalized_base_text.size() &&
+                    normalized_candidate_text.rfind(normalized_base_text, 0) == 0) {
+                    overlap = base_words.size();
+                    merged_words = candidate_words;
+                } else {
+                    overlap = suffix_prefix_word_overlap(base_words,
+                                                         candidate_words,
+                                                         static_cast<size_t>(std::max<int32_t>(16, streaming_cfg.unfixed_token_num * 8)));
+                    merged_words = base_words;
+                    merged_words.insert(merged_words.end(), candidate_words.begin() + static_cast<std::ptrdiff_t>(overlap), candidate_words.end());
+                }
+
+                if (should_accept_streaming_candidate(current_words,
+                                                     base_words,
+                                                     candidate_words,
+                                                     merged_words,
+                                                     streaming_cfg.unfixed_token_num,
+                                                     overlap)) {
+                    const int32_t rollback_words = (chunk_idx < static_cast<size_t>(streaming_cfg.unfixed_chunk_num))
+                        ? static_cast<int32_t>(merged_words.size())
+                        : streaming_cfg.unfixed_token_num;
+                    if (merged_words.size() > static_cast<size_t>(rollback_words)) {
+                        confirmed_words.assign(merged_words.begin(), merged_words.end() - rollback_words);
+                        provisional_words.assign(merged_words.end() - rollback_words, merged_words.end());
+                    } else {
+                        confirmed_words.clear();
+                        provisional_words = merged_words;
+                    }
+                    current_words = merged_words;
+                    transcript_text = join_words(current_words);
+                    if (!pass.language_tag.empty() && pass.language_tag != "unknown") {
+                        language_tag = pass.language_tag;
+                    }
+                }
+
+                const double window_start_sec = static_cast<double>(chunk_start) / 100.0;
+                const double window_end_sec = static_cast<double>(chunk_end) / 100.0;
+                std::cout << "[stream] chunk " << (chunk_idx + 1) << "/" << streaming_chunk_count
+                          << " window_s=[" << std::fixed << std::setprecision(2) << window_start_sec << ", " << window_end_sec << "]"
+                          << " text=" << transcript_text << std::endl;
+            }
         }
-    }
-    if (text_only && language_tag == "unknown") {
-        language_tag = "n/a";
+
+        if (transcript_text.empty()) {
+            transcript_text = final_pass.transcript_text;
+        }
+        transcript_text = clean_transcript_text(transcript_text);
+        if ((language_tag.empty() || language_tag == "unknown") && !final_pass.language_tag.empty()) {
+            language_tag = final_pass.language_tag;
+        }
+        transcript_text = postprocess_transcript_for_language(transcript_text, language_tag);
+    } else {
+        final_pass = run_asr_decode_pass(input_audio_features, max_new_tokens, {}, false);
+        audio_encode_ms = final_pass.audio_encode_ms;
+        ttft_ms = final_pass.ttft_ms;
+        decode_ms = final_pass.decode_ms;
+        decode_tail_tokens = final_pass.decode_tail_tokens;
+        infer_steps = final_pass.infer_steps;
+        asr_infer_ms = final_pass.ttft_ms + final_pass.decode_ms;
+        prompt_token_size = final_pass.prompt_token_size;
+        logits_shape = final_pass.logits_shape;
+        transcript_text = final_pass.transcript_text;
+        language_tag = final_pass.language_tag;
     }
 
     std::string preview;
-    const size_t preview_count = std::min<size_t>(generated_ids.size(), 10);
+    const size_t preview_count = std::min<size_t>(final_pass.generated_ids.size(), 10);
     for (size_t i = 0; i < preview_count; ++i) {
         if (i > 0) {
             preview += " | ";
         }
-        preview += std::to_string(generated_ids[i]);
+        preview += std::to_string(final_pass.generated_ids[i]);
         preview += ":";
-        preview += tokenizer.decode({generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
+        preview += tokenizer.decode({final_pass.generated_ids[i]}, {ov::genai::skip_special_tokens(false)});
     }
 
     std::cout << "Qwen3-ASR smoke run completed" << std::endl;
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "  device: " << device << std::endl;
     std::cout << "  text_only: " << (text_only ? "true" : "false") << std::endl;
+    std::cout << "  streaming: " << (streaming_cfg.enabled ? "true" : "false") << std::endl;
     if (wav_path.has_value()) {
         std::cout << "  wav: " << wav_path->string() << std::endl;
     }
     if (!text_only) {
-        std::cout << "  audio_embeds shape: [" << embeds_shape[0] << ", " << embeds_shape[1] << ", " << embeds_shape[2]
+        std::cout << "  audio_embeds shape: [" << final_pass.embeds_shape[0] << ", " << final_pass.embeds_shape[1] << ", " << final_pass.embeds_shape[2]
                   << "]" << std::endl;
-        std::cout << "  audio_output_lengths[0]: " << audio_out_lengths.data<int64_t>()[0] << std::endl;
+        std::cout << "  audio_output_lengths[0]: " << final_pass.audio_output_length << std::endl;
         if (input_audio_sample_rate > 0) {
             std::cout << "  audio_input_sample_rate_hz: " << input_audio_sample_rate << std::endl;
         }
     }
+    if (streaming_cfg.enabled) {
+        std::cout << "  streaming_chunks: " << streaming_chunk_count << std::endl;
+        std::cout << "  stream_chunk_sec: " << streaming_cfg.chunk_sec << std::endl;
+        std::cout << "  stream_window_sec: " << streaming_cfg.window_sec << std::endl;
+    }
     std::cout << "  logits shape: [" << logits_shape[0] << ", " << logits_shape[1] << ", " << logits_shape[2] << "]"
               << std::endl;
-    std::cout << "  generated tokens: " << generated_ids.size() << std::endl;
+    std::cout << "  generated tokens: " << final_pass.generated_ids.size() << std::endl;
     std::cout << "  token preview: " << preview << std::endl;
     std::cout << "  language: " << language_tag << std::endl;
     std::cout << "  text: " << transcript_text << std::endl;
 
     const double model_build_ms = elapsed_ms(build_start, build_end);
     const double model_compile_ms = elapsed_ms(compile_start, compile_end);
-    const double feature_extract_ms = elapsed_ms(feature_extract_start, feature_extract_end);
-    const double audio_encode_ms = elapsed_ms(audio_encode_start, audio_encode_end);
-    const double asr_infer_ms = elapsed_ms(asr_infer_start, asr_infer_end);
     const double tpot_ms = decode_tail_tokens > 0 ? (decode_ms / static_cast<double>(decode_tail_tokens)) : 0.0;
     const double throughput = decode_ms > 0.0 ? (static_cast<double>(decode_tail_tokens) * 1000.0 / decode_ms) : 0.0;
     const double asr_rtf = (!text_only && input_audio_duration_seconds > 0.0)
                                ? (asr_infer_ms / 1000.0) / input_audio_duration_seconds
                                : 0.0;
 
+    size_t output_token_size = final_pass.generated_ids.size();
+    if (streaming_cfg.enabled && !transcript_text.empty()) {
+        auto final_tokens = tokenizer.encode(transcript_text, {ov::genai::add_special_tokens(false)});
+        output_token_size = tensor_row_to_i64_vector(final_tokens.input_ids).size();
+    }
+
     // Keep compatibility with reporting scripts that scan for these labels.
     std::cout << "Prompt token size: " << prompt_token_size << std::endl;
-    std::cout << "Output token size: " << generated_ids.size() << std::endl;
+    std::cout << "Output token size: " << output_token_size << std::endl;
     std::cout << "Generate time: " << asr_infer_ms << " ms" << std::endl;
     std::cout << "TTFT: " << ttft_ms << " ms" << std::endl;
     if (decode_tail_tokens > 0) {
