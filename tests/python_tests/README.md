@@ -41,6 +41,22 @@ python -m pytest tests/python_tests/ -k "test_multibatch" --model_ids "TinyLlama
 
 List of currently supported models can be found in tests/python_tests/data/models.py:get_models_list
 
+Qwen3-ASR smoke tests are opt-in, use the low-level `openvino_genai` engine directly, and expect local assets instead of auto-conversion. To run them, provide:
+```sh
+QWEN3_ASR_TEST_MODEL_DIR=/path/to/qwen3_asr_text_model \
+QWEN3_ASR_TEST_AUDIO=/path/to/audio.wav \
+QWEN3_ASR_TEST_AUDIO_MODEL_DIR=/path/to/qwen3_asr_audio_model \
+python -m pytest tests/python_tests/test_qwen3_asr.py -m real_models
+```
+
+Optional variables:
+```sh
+QWEN3_ASR_TEST_DEVICE=CPU
+QWEN3_ASR_TEST_CONTEXT=""
+QWEN3_ASR_TEST_LANGUAGE=English
+QWEN3_ASR_TEST_MAX_NEW_TOKENS=256
+```
+
 ## Test Samples
 To test samples, set the `SAMPLES_PY_DIR` and `SAMPLES_CPP_DIR` environment variables to the directories containing your Python samples and built C++ samples respectively. The `SAMPLES_CPP_DIR` should point to the folder with built C++ samples, which can be installed using `cmake --component samples_bin`. For example:
 ```sh

@@ -88,6 +88,14 @@ bool text_model_cache_supports_mode(const std::shared_ptr<ov::Model>& model, boo
     return has_audio_inputs == expect_audio_inputs;
 }
 
+bool get_loaded_from_cache(const ov::CompiledModel& compiled_model) {
+    try {
+        return compiled_model.get_property(ov::loaded_from_cache);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 double elapsed_ms(const std::chrono::steady_clock::time_point& start,
                   const std::chrono::steady_clock::time_point& end) {
     return std::chrono::duration<double, std::milli>(end - start).count();
@@ -786,19 +794,21 @@ std::string merge_prefix_and_continuation_text(const std::string& prefix, const 
 
 class Qwen3ASRInferenceEngine {
 public:
-    Qwen3ASRInferenceEngine(const std::filesystem::path& text_model_dir,
-                           const std::optional<std::filesystem::path>& audio_model_dir,
-                           const std::string& device,
-                           int32_t max_new_tokens,
-                           const std::optional<int32_t>& n_window,
-                           const std::optional<int32_t>& n_window_infer,
-                           bool cache_model,
-                           const ov::AnyMap& compile_properties)
-        : text_model_dir_(text_model_dir),
-          audio_model_dir_(audio_model_dir.value_or(text_model_dir)),
-          device_(device),
-          max_new_tokens_(max_new_tokens),
-                      compile_properties_(compile_properties) {
+        Qwen3ASRInferenceEngine(const std::filesystem::path& text_model_dir,
+                                                        const std::optional<std::filesystem::path>& audio_model_dir,
+                                                        const std::string& device,
+                                                        int32_t max_new_tokens,
+                                                        const std::optional<int32_t>& n_window,
+                                                        const std::optional<int32_t>& n_window_infer,
+                                                        bool cache_model,
+                                                        const std::optional<std::string>& openvino_cache_dir,
+                                                        const ov::AnyMap& compile_properties)
+                : text_model_dir_(text_model_dir),
+                    audio_model_dir_(audio_model_dir.value_or(text_model_dir)),
+                    device_(device),
+                    max_new_tokens_(max_new_tokens),
+                    openvino_cache_dir_(openvino_cache_dir),
+                    compile_properties_(compile_properties) {
         if (max_new_tokens_ <= 0) {
             throw std::runtime_error("max_new_tokens must be > 0");
         }
@@ -835,10 +845,12 @@ public:
             auto candidate = core.read_model(text_xml.string(), text_bin.string());
             if (text_model_cache_supports_mode(candidate, true)) {
                 text_model = std::move(candidate);
+                text_ir_loaded_from_cache_ = true;
             }
         }
         if (cache_model && has_ir_model_pair(audio_xml, audio_bin)) {
             audio_model = core.read_model(audio_xml.string(), audio_bin.string());
+            audio_ir_loaded_from_cache_ = true;
         }
 
         if (!text_model) {
@@ -865,6 +877,8 @@ public:
 
         compiled_text_ = core.compile_model(text_model, device_, compile_properties_);
         compiled_audio_ = core.compile_model(audio_model, device_, compile_properties_);
+        text_compiled_model_loaded_from_cache_ = get_loaded_from_cache(compiled_text_);
+        audio_compiled_model_loaded_from_cache_ = get_loaded_from_cache(compiled_audio_);
 
         ScopedVar env_manager(pyutils::ov_tokenizers_module_path());
         tokenizer_.emplace(text_model_dir_, ov::AnyMap{{"fix_mistral_regex", true}});
@@ -905,6 +919,30 @@ public:
             preprocessor_json_ = text_model_dir_ / "preprocessor_config.json";
         }
         feature_extractor_.emplace(preprocessor_json_);
+    }
+
+    bool text_ir_loaded_from_cache() const {
+        return text_ir_loaded_from_cache_;
+    }
+
+    bool audio_ir_loaded_from_cache() const {
+        return audio_ir_loaded_from_cache_;
+    }
+
+    bool text_compiled_model_loaded_from_cache() const {
+        return text_compiled_model_loaded_from_cache_;
+    }
+
+    bool audio_compiled_model_loaded_from_cache() const {
+        return audio_compiled_model_loaded_from_cache_;
+    }
+
+    bool compile_cache_enabled() const {
+        return openvino_cache_dir_.has_value() && !openvino_cache_dir_->empty();
+    }
+
+    const std::optional<std::string>& openvino_cache_dir() const {
+        return openvino_cache_dir_;
     }
 
     Qwen3ASRDecodedResult generate(const std::vector<float>& pcm16k,
@@ -1231,6 +1269,14 @@ private:
                 result.language = language_from_tokens;
             }
         }
+        if (result.language.empty() || result.language == "unknown") {
+            std::string transcript_for_lang = result.text;
+            const std::string language_from_text = extract_language_from_prefix(transcript_for_lang);
+            if (!language_from_text.empty()) {
+                result.language = language_from_text;
+                result.text = transcript_for_lang;
+            }
+        }
         if (result.language.empty()) {
             result.language = "unknown";
         }
@@ -1250,6 +1296,7 @@ private:
     std::filesystem::path preprocessor_json_;
     std::string device_;
     int32_t max_new_tokens_ = 512;
+    std::optional<std::string> openvino_cache_dir_;
     ov::AnyMap compile_properties_;
     ov::genai::modeling::models::Qwen3ASRTextConfig text_cfg_;
     ov::genai::modeling::models::Qwen3ASRAudioConfig audio_cfg_;
@@ -1260,6 +1307,10 @@ private:
     std::unordered_map<std::string, int64_t> vocab_;
     std::unordered_set<int64_t> excluded_decode_ids_;
     std::unordered_set<int64_t> stop_token_ids_;
+    bool text_ir_loaded_from_cache_ = false;
+    bool audio_ir_loaded_from_cache_ = false;
+    bool text_compiled_model_loaded_from_cache_ = false;
+    bool audio_compiled_model_loaded_from_cache_ = false;
     int64_t audio_pad_token_id_ = -1;
     int64_t bos_token_id_ = -1;
     int64_t eos_token_id_ = -1;
@@ -1305,7 +1356,15 @@ void init_qwen3_asr(py::module_& m) {
                     properties.insert({ov::cache_dir(*openvino_cache_dir)});
                 }
                 return std::make_unique<Qwen3ASRInferenceEngine>(
-                    models_path, audio_model_path, device, max_new_tokens, n_window, n_window_infer, cache_model, properties);
+                    models_path,
+                    audio_model_path,
+                    device,
+                    max_new_tokens,
+                    n_window,
+                    n_window_infer,
+                    cache_model,
+                    openvino_cache_dir,
+                    properties);
             }),
             py::arg("models_path"),
             py::arg("device") = "GPU",
@@ -1328,6 +1387,35 @@ void init_qwen3_asr(py::module_& m) {
             openvino_cache_dir (str | None): Optional OpenVINO compile cache directory.
             kwargs: Additional OpenVINO compile properties.
         )")
+        .def_property_readonly(
+            "text_ir_loaded_from_cache",
+            &Qwen3ASRInferenceEngine::text_ir_loaded_from_cache,
+            "True when the text IR was loaded from serialized XML/BIN cache files.")
+        .def_property_readonly(
+            "audio_ir_loaded_from_cache",
+            &Qwen3ASRInferenceEngine::audio_ir_loaded_from_cache,
+            "True when the audio IR was loaded from serialized XML/BIN cache files.")
+        .def_property_readonly(
+            "text_compiled_model_loaded_from_cache",
+            &Qwen3ASRInferenceEngine::text_compiled_model_loaded_from_cache,
+            "True when the compiled text model was restored from OpenVINO compile cache.")
+        .def_property_readonly(
+            "audio_compiled_model_loaded_from_cache",
+            &Qwen3ASRInferenceEngine::audio_compiled_model_loaded_from_cache,
+            "True when the compiled audio model was restored from OpenVINO compile cache.")
+        .def_property_readonly(
+            "compile_cache_enabled",
+            &Qwen3ASRInferenceEngine::compile_cache_enabled,
+            "True when an OpenVINO compile cache directory was configured.")
+        .def_property_readonly(
+            "openvino_cache_dir",
+            [](const Qwen3ASRInferenceEngine& engine) -> py::object {
+                if (!engine.openvino_cache_dir().has_value()) {
+                    return py::none();
+                }
+                return py::cast(*engine.openvino_cache_dir());
+            },
+            "Configured OpenVINO compile cache directory, if any.")
         .def(
             "generate",
             [](Qwen3ASRInferenceEngine& engine,
