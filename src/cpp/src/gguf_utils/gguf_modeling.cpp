@@ -6,14 +6,23 @@
 #include <string>
 #include <iostream>
 #include <chrono>
+#include <cstdlib>
+#include <algorithm>
+#include <cctype>
 #include <stdexcept>
 
 #include <openvino/openvino.hpp>
 #include "openvino/runtime/core.hpp"
 #include "openvino/opsets/opset13.hpp"
+#include "openvino/pass/serialize.hpp"
 
 #include "gguf_utils/building_blocks.hpp"
+#include "gguf_utils/gguf_weight_finalizer.hpp"
+#include "gguf_utils/gguf_weight_source.hpp"
 #include "gguf_utils/gguf_modeling.hpp"
+#include "modeling/models/qwen3/modeling_qwen3.hpp"
+#include "modeling/models/qwen3_moe/modeling_qwen3_moe.hpp"
+#include "modeling/models/smollm3/modeling_smollm3.hpp"
 #include "utils.hpp"
 
 using namespace ov;
@@ -26,6 +35,28 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+bool use_modeling_qwen3_dense_dummy_builder() {
+    auto is_truthy = [](std::string v) {
+        std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        return v == "1" || v == "true" || v == "on" || v == "yes" ;
+    };
+
+    if (const char* v = std::getenv("OV_GENAI_USE_MODELING_API")) {
+        return is_truthy(v);
+    }
+    return false;
+}
+
+void apply_runtime_options(const std::map<std::string, GGUFMetaData>& configs,
+                           const std::shared_ptr<ov::Model>& model) {
+    if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {
+        model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    }
+    model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+}
 
 std::shared_ptr<ov::Model> create_language_model(
     const std::map<std::string, GGUFMetaData>& configs,
@@ -127,6 +158,11 @@ std::shared_ptr<ov::Model> create_language_model(
     ov::ParameterVector inputs{input_ids, attention_mask, position_ids, beam_idx};
     auto model = std::make_shared<ov::Model>(ov::OutputVector({logits->output(0)}), sinks, inputs);
 
+    // debuglog
+    if (0) {
+        ov::serialize(model, "full_model_original.xml", "full_model_original.bin");
+    }
+
     // Set runtime options
     if (std::get<int>(configs.at("file_type")) == 1 || std::get<int>(configs.at("file_type")) == 0) {
         model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
@@ -155,7 +191,69 @@ std::shared_ptr<ov::Model> create_from_gguf(const std::string& model_path, const
     ss.str("");
     ss << "Start generating OpenVINO model...";
     ov::genai::utils::print_gguf_debug_info(ss.str());
-    if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3")) {
+    if (!model_arch.compare("smollm3")) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: SmolLM3 builder");
+        ov::genai::modeling::models::SmolLM3Config cfg;
+        cfg.architecture = std::get<std::string>(config.at("architecture"));
+        cfg.hidden_size = std::get<int>(config.at("hidden_size"));
+        cfg.num_hidden_layers = std::get<int>(config.at("layer_num"));
+        cfg.num_attention_heads = std::get<int>(config.at("head_num"));
+        cfg.num_key_value_heads = std::get<int>(config.at("head_num_kv"));
+        cfg.head_dim = std::get<int>(config.at("head_size"));
+        cfg.rope_theta = std::get<float>(config.at("rope_freq_base"));
+        cfg.rms_norm_eps = std::get<float>(config.at("rms_norm_eps"));
+        cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.mlp_bias = consts.count("model.layers[0].mlp.gate_proj.bias") > 0;
+        cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
+        if (config.count("no_rope_layer_interval")) {
+            cfg.no_rope_layer_interval = std::get<int>(config.at("no_rope_layer_interval"));
+        }
+        if (config.count("no_rope_layers")) {
+            cfg.no_rope_layers = std::get<std::vector<int32_t>>(config.at("no_rope_layers"));
+        }
+        ov::genai::gguf::GGUFWeightSource source(consts);
+        ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+        model = ov::genai::modeling::models::create_smollm3_model(cfg, source, finalizer);
+        apply_runtime_options(config, model);
+    } else if (!model_arch.compare("qwen3") && use_modeling_qwen3_dense_dummy_builder()) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: qwen3 dense dummy builder");
+        ov::genai::modeling::models::Qwen3DenseConfig cfg;
+        cfg.architecture = std::get<std::string>(config.at("architecture"));
+        cfg.hidden_size = std::get<int>(config.at("hidden_size"));
+        cfg.num_hidden_layers = std::get<int>(config.at("layer_num"));
+        cfg.num_attention_heads = std::get<int>(config.at("head_num"));
+        cfg.num_key_value_heads = std::get<int>(config.at("head_num_kv"));
+        cfg.head_dim = std::get<int>(config.at("head_size"));
+        cfg.rope_theta = std::get<float>(config.at("rope_freq_base"));
+        cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.rms_norm_eps = std::get<float>(config.at("rms_norm_eps"));
+        cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
+        ov::genai::gguf::GGUFWeightSource source(consts);
+        ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+        model = ov::genai::modeling::models::create_qwen3_dense_model(cfg, source, finalizer);
+        apply_runtime_options(config, model);
+    } else if (!model_arch.compare("qwen3moe") && use_modeling_qwen3_dense_dummy_builder()) {
+        ov::genai::utils::print_gguf_debug_info("Using modeling API: qwen3 moe builder");
+        ov::genai::modeling::models::Qwen3MoeConfig cfg;
+        cfg.architecture = std::get<std::string>(config.at("architecture"));
+        cfg.hidden_size = std::get<int>(config.at("hidden_size"));
+        cfg.num_hidden_layers = std::get<int>(config.at("layer_num"));
+        cfg.num_attention_heads = std::get<int>(config.at("head_num"));
+        cfg.num_key_value_heads = std::get<int>(config.at("head_num_kv"));
+        cfg.head_dim = std::get<int>(config.at("head_size"));
+        cfg.intermediate_size = std::get<int>(config.at("moe_inter_size"));
+        cfg.rope_theta = std::get<float>(config.at("rope_freq_base"));
+        cfg.attention_bias = consts.count("model.layers[0].self_attn.q_proj.bias") > 0;
+        cfg.rms_norm_eps = std::get<float>(config.at("rms_norm_eps"));
+        cfg.tie_word_embeddings = consts.count("lm_head.weight") == 0;
+        cfg.expert_count = std::get<int>(config.at("expert_count"));
+        cfg.expert_used_count = std::get<int>(config.at("expert_used_count"));
+        cfg.moe_intermediate_size = std::get<int>(config.at("moe_inter_size"));
+        ov::genai::gguf::GGUFWeightSource source(consts);
+        ov::genai::gguf::GGUFWeightFinalizer finalizer(consts, qtypes);
+        model = ov::genai::modeling::models::create_qwen3_moe_model(cfg, source, finalizer);
+        apply_runtime_options(config, model);
+    } else if (!model_arch.compare("llama") || !model_arch.compare("qwen2") || !model_arch.compare("qwen3") || !model_arch.compare("qwen3moe")) {
         model = create_language_model(config, consts, qtypes);
         if (enable_save_ov_model){
             std::filesystem::path gguf_model_path(model_path);

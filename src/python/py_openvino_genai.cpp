@@ -44,6 +44,7 @@ void init_video_generation_models(py::module_& m);
 void init_video_generation_pipelines(py::module_& m);
 void init_vlm_pipeline(py::module_& m);
 void init_whisper_pipeline(py::module_& m);
+void init_qwen3_asr(py::module_& m);
 void init_rag_pipelines(py::module_& m);
 void init_speech_generation_pipeline(py::module_& m);
 
@@ -138,6 +139,7 @@ PYBIND11_MODULE(py_openvino_genai, m) {
     init_video_generation_pipelines(m);
     init_vlm_pipeline(m);
     init_whisper_pipeline(m);
+    init_qwen3_asr(m);
     init_rag_pipelines(m);
     init_speech_generation_pipeline(m);
 }

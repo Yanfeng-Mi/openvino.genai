@@ -1,0 +1,63 @@
+(openvino_env) PS C:\Users\gta\chuansheng\src_code\openvino-new-arch\openvino\bin\intel64\RelWithDebInfo> $env:PATH = "C:\Users\gta\chuansheng\src_code\openvino-new-arch\openvino.genai\build\openvino_genai;" + $env:PATH; cd "C:\Users\gta\chuansheng\src_code\openvino-new-arch\openvino\bin\intel64\RelWithDebInfo"; & "C:\Users\gta\chuansheng\src_code\openvino-new-arch\openvino.genai\build\samples\cpp\text_generation\RelWithDebInfo\greedy_causal_lm.exe" "C:\Users\gta\chuansheng\qwen3-4b-hf" "introduce ffmpeg" GPU 1 1 100                                         
+[Safetensors] Loading model from: "C:\\Users\\gta\\chuansheng\\qwen3-4b-hf"
+[Safetensors] OpenVINO tokenizer already exists, skipping conversion
+[Safetensors] Loading config.json...
+[Safetensors] Model: qwen3
+[Safetensors] Hidden size: 2560
+[Safetensors] Layers: 36
+[Safetensors] Attention heads: 32
+[Safetensors] KV heads: 8
+[Safetensors] Loading safetensors weights...
+[Safetensors] Loading 3 file(s)...
+[Safetensors] Loading "model-00001-of-00003.safetensors"...
+[Safetensors] Loading "model-00002-of-00003.safetensors"...
+[Safetensors] Loading "model-00003-of-00003.safetensors"...
+[Safetensors] Loaded 398 tensors
+[Safetensors] First 10 weight names:
+  - model.embed_tokens.weight (shape: 151936x2560)
+  - model.layers.13.mlp.gate_proj.weight (shape: 9728x2560)
+  - model.layers.1.self_attn.o_proj.weight (shape: 2560x4096)
+  - model.layers.12.self_attn.o_proj.weight (shape: 2560x4096)
+  - model.layers.0.mlp.gate_proj.weight (shape: 9728x2560)
+  - model.layers.13.input_layernorm.weight (shape: 2560)
+  - model.layers.32.self_attn.o_proj.weight (shape: 2560x4096)
+  - model.layers.0.input_layernorm.weight (shape: 2560)
+  - model.layers.0.self_attn.k_proj.weight (shape: 1024x2560)
+  - model.layers.12.self_attn.v_proj.weight (shape: 1024x2560)
+[Safetensors] Loaded 398 weight tensors
+[Safetensors] Converting weight names to building_blocks format...
+[Safetensors] First 10 converted weight names:
+  - model.layers[22].mlp.up_proj.weight
+  - model.layers[0].mlp.gate_proj.weight
+  - model.layers[29].mlp.down_proj.weight
+  - model.embed_tokens.weight
+  - model.layers[1].self_attn.k_proj.weight
+  - model.layers[0].input_layernorm.weight
+  - model.layers[12].mlp.down_proj.weight
+  - model.layers[33].input_layernorm.weight
+  - model.layers[13].mlp.gate_proj.weight
+  - model.layers[13].self_attn.v_proj.weight
+[Safetensors] Weight loading done. Time: 4197ms
+[Safetensors] Building OpenVINO model...
+[Safetensors] Building 36 transformer layers...
+[Safetensors] Built layer 10/36
+[Safetensors] Built layer 20/36
+[Safetensors] Built layer 30/36
+[Safetensors] Built layer 36/36
+[Safetensors] Model building done. Time: 13ms
+[Safetensors] Total time: 4211ms
+Prompt token size: 3
+Output token size: 100
+Load time: 8840.00 ms
+Generate time: 1888.35 ┬▒ 0.00 ms
+Tokenization time: 0.43 ┬▒ 0.00 ms
+Detokenization time: 0.30 ┬▒ 0.00 ms
+TTFT: 18.84 ┬▒ 0.00 ms
+TPOT: 18.88 ┬▒ 0.17 ms/token
+Throughput: 52.96 ┬▒ 0.47 tokens/s
+Generated text:  and its use in video processing
+
+FFmpeg is a powerful, open-source command-line tool used for processing and manipulating multimedia files, including audio, video, and subtitles. It is widely used in the development of video processing applications, streaming services, and content creation workflows. FFmpeg supports a vast array of formats and codecs, making it a versatile tool for tasks such as video conversion, trimming, scaling, encoding, decoding, and more.
+
+### Key Features of FFmpeg:
+1. **Format Support

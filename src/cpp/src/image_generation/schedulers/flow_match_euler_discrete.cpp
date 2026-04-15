@@ -46,7 +46,11 @@ FlowMatchEulerDiscreteScheduler::Config::Config(const std::filesystem::path& sch
     using utils::read_json_param;
 
     read_json_param(data, "num_train_timesteps", num_train_timesteps);
+    const bool has_shift = data.contains("shift");
     read_json_param(data, "shift", shift);
+    if (!has_shift && data.contains("flow_shift")) {
+        read_json_param(data, "flow_shift", shift);
+    }
     read_json_param(data, "use_dynamic_shifting", use_dynamic_shifting);
     read_json_param(data, "base_shift", base_shift);
     read_json_param(data, "max_shift", max_shift);

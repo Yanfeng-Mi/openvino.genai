@@ -71,6 +71,8 @@ from .py_openvino_genai import TokenizedInputs, Tokenizer
 # Whisper
 from .py_openvino_genai import (
     WhisperGenerationConfig,
+    Qwen3ASRDecodedResult,
+    Qwen3ASRInferenceEngine,
     WhisperPipeline,
     WhisperRawPerfMetrics,
     WhisperPerfMetrics,

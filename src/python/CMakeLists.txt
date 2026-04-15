@@ -27,14 +27,19 @@ endif()
 file(GLOB python_sources "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 
 set(TARGET_NAME py_openvino_genai)
-pybind11_add_module(${TARGET_NAME} ${python_sources})
+pybind11_add_module(${TARGET_NAME}
+    ${python_sources}
+    $<TARGET_OBJECTS:openvino_genai_obj>)
 if(NOT ENABLE_GIL_PYTHON_API)
     # disable GIL for free-threaded python build
     target_compile_definitions(${TARGET_NAME} PRIVATE Py_GIL_DISABLED=1)
 endif()
 
-target_link_libraries(${TARGET_NAME} PRIVATE openvino::genai)
+target_link_libraries(${TARGET_NAME} PRIVATE
+    openvino::genai
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
 target_include_directories(${TARGET_NAME} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/.." "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src") # for tokenizer/tokenizers_path.hpp
+target_compile_definitions(${TARGET_NAME} PRIVATE openvino_genai_EXPORTS)
 set_target_properties(${TARGET_NAME} PROPERTIES
     ARCHIVE_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/openvino_genai/>"
     LIBRARY_OUTPUT_DIRECTORY "$<1:${CMAKE_BINARY_DIR}/openvino_genai/>"
@@ -211,3 +216,5 @@ else()
 endif()
 
 add_dependencies(${TARGET_NAME}_stub ${TARGET_NAME})
+
+

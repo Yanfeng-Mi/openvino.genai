@@ -69,7 +69,7 @@ public:
      * highest importance score sum not exceeding this threshold will be taking part in the computations. The lower the
      * threshold, the less computation will the main attention operation will take, and vice versa, with the
      * corresponding potential impact on generation accuracy. */
-    float xattention_threshold = 0.8;
+    float xattention_threshold = 0.8f;
 
     /** XATTENTION mode only - Block granularity, in tokens, with which the block-sparse attention calculation will be
      * applied.*/
