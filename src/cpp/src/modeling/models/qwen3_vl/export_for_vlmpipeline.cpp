@@ -25,6 +25,7 @@
 #include "safetensors_utils/safetensors_loader.hpp"
 #include "safetensors_utils/safetensors_weight_finalizer.hpp"
 #include "safetensors_utils/safetensors_weight_source.hpp"
+#include "safetensors_utils/quantization_utils.hpp"
 
 namespace {
 
@@ -54,25 +55,6 @@ std::string resolve_pos_embed_name(weights::WeightSource& source) {
         }
     }
     OPENVINO_THROW("Failed to locate visual.pos_embed.weight in safetensors");
-}
-
-ov::genai::safetensors::QuantizationConfig create_quantization_config(
-    const std::string& mode,
-    int group_size,
-    const std::string& backup_mode) {
-    ov::genai::safetensors::QuantizationConfig config;
-    if (mode == "INT4") {
-        config.mode = ov::genai::safetensors::QuantizationMode::INT4;
-    } else if (mode == "INT8") {
-        config.mode = ov::genai::safetensors::QuantizationMode::INT8;
-    } else {
-        config.mode = ov::genai::safetensors::QuantizationMode::NONE;
-    }
-    config.group_size = static_cast<size_t>(group_size);
-    if (backup_mode == "INT8") {
-        config.backup_mode = ov::genai::safetensors::QuantizationMode::INT8;
-    }
-    return config;
 }
 
 }  // namespace
