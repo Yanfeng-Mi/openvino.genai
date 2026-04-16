@@ -306,3 +306,31 @@ add_custom_command(TARGET modeling_glm_ocr POST_BUILD
 set_target_properties(modeling_glm_ocr PROPERTIES
     # Ensure out of box LC_RPATH on macOS with SIP
     INSTALL_RPATH_USE_LINK_PATH ON)
+
+# Qwen3-VL VLMPipeline export sample
+add_executable(export_qwen3_vl
+    export_qwen3_vl.cpp
+    $<TARGET_OBJECTS:openvino_genai_obj>)
+
+target_include_directories(export_qwen3_vl PRIVATE
+    "${OpenVINOGenAI_SOURCE_DIR}/src/cpp/src"
+    "${OpenVINOGenAI_SOURCE_DIR}/openvino/thirdparty/json/nlohmann_json/include"
+    $<TARGET_PROPERTY:openvino::genai,INTERFACE_INCLUDE_DIRECTORIES>)
+
+target_link_libraries(export_qwen3_vl PRIVATE
+    $<TARGET_PROPERTY:openvino_genai_obj,LINK_LIBRARIES>)
+
+target_compile_definitions(export_qwen3_vl PRIVATE
+    openvino_genai_EXPORTS)
+
+add_dependencies(export_qwen3_vl openvino_genai)
+
+add_custom_command(TARGET export_qwen3_vl POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "$<TARGET_FILE_DIR:openvino_genai>/${tokenizers_dll_name}"
+            "$<TARGET_FILE_DIR:export_qwen3_vl>"
+    VERBATIM)
+
+set_target_properties(export_qwen3_vl PROPERTIES
+    # Ensure out of box LC_RPATH on macOS with SIP
+    INSTALL_RPATH_USE_LINK_PATH ON)

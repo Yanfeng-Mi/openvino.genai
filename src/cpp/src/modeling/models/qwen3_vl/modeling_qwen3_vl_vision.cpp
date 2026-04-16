@@ -140,7 +140,8 @@ Tensor Qwen3VLVisionAttention::apply_rotary(const Tensor& x,
 
 Tensor Qwen3VLVisionAttention::forward(const Tensor& hidden_states,
                                        const Tensor& rotary_cos,
-                                       const Tensor& rotary_sin) const {
+                                       const Tensor& rotary_sin,
+                                       const Tensor* attention_mask) const {
     auto qkv = add_bias_if_present(ops::linear(hidden_states, qkv_weight()), qkv_bias());
     auto qkv_reshaped = qkv.reshape({0, 3, num_heads_, head_dim_});
     auto q = ops::slice(qkv_reshaped, 0, 1, 1, 1).squeeze(1);
@@ -155,7 +156,13 @@ Tensor Qwen3VLVisionAttention::forward(const Tensor& hidden_states,
     auto v_heads = v.permute({1, 0, 2}).unsqueeze(0);
 
     auto* policy = &ctx().op_policy();
-    auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, nullptr, false, policy);
+    const Tensor* mask_ptr = nullptr;
+    Tensor mask_4d;
+    if (attention_mask) {
+        mask_4d = attention_mask->unsqueeze(1);
+        mask_ptr = &mask_4d;
+    }
+    auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, mask_ptr, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(hidden_size_);
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
     auto merged_2d = merged.squeeze(0);
@@ -251,9 +258,10 @@ const Tensor& Qwen3VLVisionBlock::norm2_bias() const {
 
 Tensor Qwen3VLVisionBlock::forward(const Tensor& hidden_states,
                                    const Tensor& rotary_cos,
-                                   const Tensor& rotary_sin) const {
+                                   const Tensor& rotary_sin,
+                                   const Tensor* attention_mask) const {
     auto norm1 = ops::nn::layer_norm(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
-    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin);
+    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin, attention_mask);
     auto resid1 = hidden_states + attn_out;
     auto norm2 = ops::nn::layer_norm(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
     auto mlp_out = mlp_.forward(norm2);
@@ -359,16 +367,24 @@ Qwen3VLVisionOutput Qwen3VLVisionModel::forward(const Tensor& pixel_values,
                                                 const Tensor& grid_thw,
                                                 const Tensor& pos_embeds,
                                                 const Tensor& rotary_cos,
-                                                const Tensor& rotary_sin) {
+                                                const Tensor& rotary_sin,
+                                                const Tensor* attention_mask) {
     (void)grid_thw;
     auto hidden_states = patch_embed_.forward(pixel_values);
     hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype());
+    return forward_blocks(hidden_states, rotary_cos, rotary_sin, attention_mask);
+}
 
+Qwen3VLVisionOutput Qwen3VLVisionModel::forward_blocks(const Tensor& hidden_states_in,
+                                                       const Tensor& rotary_cos,
+                                                       const Tensor& rotary_sin,
+                                                       const Tensor* attention_mask) {
+    Tensor hidden_states = hidden_states_in;
     Qwen3VLVisionOutput output;
     output.deepstack_embeds.reserve(deepstack_mergers_.size());
 
     for (size_t layer_idx = 0; layer_idx < blocks_.size(); ++layer_idx) {
-        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin);
+        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, attention_mask);
         auto it = std::find(deepstack_indexes_.begin(),
                             deepstack_indexes_.end(),
                             static_cast<int32_t>(layer_idx));
