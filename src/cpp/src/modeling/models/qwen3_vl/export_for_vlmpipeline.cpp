@@ -11,6 +11,7 @@
 
 #include <openvino/openvino.hpp>
 #include <openvino/op/result.hpp>
+#include <openvino/runtime/properties.hpp>
 #include <nlohmann/json.hpp>
 
 #include "modeling/builder_context.hpp"
@@ -130,16 +131,16 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
                                          ov::element::f32,
                                          ov::PartialShape{-1, head_dim});
 
-    auto attention_mask = ctx.parameter("attention_mask",
-                                         ov::element::f32,
-                                         ov::PartialShape{1, -1, -1});
+    auto cu_seq_lens = ctx.parameter("cu_seq_lens",
+                                      ov::element::i32,
+                                      ov::PartialShape{-1});
 
     // Compute cos/sin from rotary_pos_emb inside the graph
     auto rotary_cos = rotary_pos_emb.cos();
     auto rotary_sin = rotary_pos_emb.sin();
 
     // Run blocks + merger + deepstack via forward_blocks (no PatchEmbed)
-    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin, &attention_mask);
+    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin, nullptr, &cu_seq_lens);
 
     // Build results
     ov::OutputVector results;
@@ -280,9 +281,6 @@ std::shared_ptr<ov::Model> create_qwen3_vl_language_model(
                                            ov::element::boolean,
                                            ov::PartialShape{-1, -1});
 
-    // attention_mask is created as parameter but not wired (causal mask is built internally)
-    (void)attention_mask;
-
     // Slice deepstack into per-layer tensors
     std::vector<Tensor> ds_slices;
     ds_slices.reserve(num_deepstack);
@@ -296,15 +294,19 @@ std::shared_ptr<ov::Model> create_qwen3_vl_language_model(
 
     // Forward: skip EmbeddingInjector (visual_embeds=nullptr), apply DeepstackInjector
     auto logits = model.forward_embeds(inputs_embeds,
-                                        position_ids,
-                                        beam_idx,
-                                        nullptr,            // visual_embeds: skip EmbeddingInjector
-                                        &visual_pos_masks,  // needed for DeepstackInjector
-                                        &ds_slices);
+                                       position_ids,
+                                       beam_idx,
+                                       &attention_mask,
+                                       nullptr,            // visual_embeds: skip EmbeddingInjector
+                                       &visual_pos_masks,  // needed for DeepstackInjector
+                                       &ds_slices);
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, "logits");
-    return ctx.build_model({result->output(0)});
+    auto ov_model = ctx.build_model({result->output(0)});
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
 }
 
 // =============================================================================

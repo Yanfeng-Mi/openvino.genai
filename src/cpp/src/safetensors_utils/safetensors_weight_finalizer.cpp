@@ -27,30 +27,56 @@ namespace safetensors {
 
 using namespace ov::genai::modeling::weights;
 
+namespace {
+
+const char* mode_name(QuantizationConfig::Mode mode) {
+    switch (mode) {
+        case QuantizationConfig::Mode::INT4_SYM:
+            return "INT4_SYM";
+        case QuantizationConfig::Mode::INT4_ASYM:
+            return "INT4_ASYM";
+        case QuantizationConfig::Mode::INT8_SYM:
+            return "INT8_SYM";
+        case QuantizationConfig::Mode::INT8_ASYM:
+            return "INT8_ASYM";
+        case QuantizationConfig::Mode::NONE:
+        default:
+            return "NONE";
+    }
+}
+
+void log_backup_weight_if_used(const QuantizationSelector& selector,
+                               const std::string& name,
+                               QuantizationConfig::Mode quant_mode,
+                               int group_size) {
+    const auto& config = selector.config();
+    const bool uses_backup_mode = config.backup_mode != QuantizationConfig::Mode::NONE &&
+                                  config.backup_mode != config.mode &&
+                                  quant_mode == config.backup_mode;
+    if (!uses_backup_mode) {
+        return;
+    }
+
+    std::cout << "[SafetensorsWeightFinalizer] Backup quant weight: " << name
+              << " (mode=" << mode_name(quant_mode)
+              << ", group_size=" << (group_size > 0 ? std::to_string(group_size) : std::string("per-channel"))
+              << ")" << std::endl;
+}
+
+}  // namespace
+
 SafetensorsWeightFinalizer::SafetensorsWeightFinalizer() = default;
 
 SafetensorsWeightFinalizer::SafetensorsWeightFinalizer(const QuantizationConfig& config)
     : selector_(config) {
     if (config.enabled()) {
         std::cout << "[SafetensorsWeightFinalizer] In-flight quantization enabled (NNCF-compatible):" << std::endl;
-        
-        // Helper lambda to print mode name
-        auto mode_name = [](QuantizationConfig::Mode m) -> std::string {
-            switch (m) {
-                case QuantizationConfig::Mode::INT4_SYM: return "INT4_SYM";
-                case QuantizationConfig::Mode::INT4_ASYM: return "INT4_ASYM";
-                case QuantizationConfig::Mode::INT8_SYM: return "INT8_SYM";
-                case QuantizationConfig::Mode::INT8_ASYM: return "INT8_ASYM";
-                case QuantizationConfig::Mode::NONE: return "NONE";
-                default: return "UNKNOWN";
-            }
-        };
-        
-        std::cout << "  Primary mode: " << mode_name(config.mode) 
+
+        std::cout << "  Primary mode: " << mode_name(config.mode)
                   << " (group_size=" << config.group_size << ")" << std::endl;
-        std::cout << "  Backup mode: " << mode_name(config.backup_mode) 
+        std::cout << "  Backup mode: " << mode_name(config.backup_mode)
                   << " (per-channel)" << std::endl;
-        
+
         if (config.backup_mode == config.mode) {
             std::cout << "  -> All layers use same mode (" 
                       << mode_name(config.mode) << ", group_size=" << config.group_size << ")" << std::endl;
@@ -468,6 +494,7 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_weight(
     // This may return different modes for different layers (e.g., INT8 for lm_head, INT4 for others)
     Mode quant_mode = selector_.get_quantization_mode(name, tensor.get_shape(), tensor.get_element_type());
     int group_size = selector_.get_group_size(name);
+    log_backup_weight_if_used(selector_, name, quant_mode, group_size);
     
     // RTN quantization functions expect 2D tensors
     OPENVINO_ASSERT(tensor.get_shape().size() == 2 || tensor.get_shape().size() == 3 || tensor.get_shape().size() == 1, 
@@ -513,6 +540,7 @@ rtn::QuantizedWeight SafetensorsWeightFinalizer::quantize_fp8_weight_direct(
     // Get quantization mode and group size for this weight
     Mode quant_mode = selector_.get_quantization_mode(name, fp8_tensor.get_shape(), fp8_tensor.get_element_type());
     int group_size = selector_.get_group_size(name);
+    log_backup_weight_if_used(selector_, name, quant_mode, group_size);
     
     // Direct FP8 -> INT4/INT8 quantization without intermediate F32 tensor
     // This saves ~4x memory compared to creating a full F32 tensor

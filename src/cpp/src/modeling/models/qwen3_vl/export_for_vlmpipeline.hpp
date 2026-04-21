@@ -68,7 +68,7 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_embeddings_model(
 
 /// Create the Vision merger model (Blocks + Merger + DeepstackMergers).
 /// Input: hidden_states [N, hidden_size] f32, rotary_pos_emb [N, head_dim] f32,
-///        attention_mask [1, N, N] f32
+///        cu_seq_lens [num_segments + 1] i32
 /// Output: last_hidden_state [N, out_hidden_size] f32,
 ///         deepstack_feature_lists [num_ds_layers, N, out_hidden_size] f32
 std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
