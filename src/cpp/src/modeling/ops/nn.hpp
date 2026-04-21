@@ -68,6 +68,17 @@ Tensor layer_norm(const Tensor& input,
                   float eps,
                   int64_t axis = -1);
 
+Tensor layer_norm_mvn(const Tensor& input,
+                      const Tensor& weight,
+                      const Tensor* bias,
+                      float eps,
+                      int64_t axis = -1);
+
+Tensor layer_norm_mvn(const Tensor& input,
+                      const Tensor& weight,
+                      float eps,
+                      int64_t axis = -1);
+
 Tensor rms_norm(const Tensor& input,
                 const Tensor& weight,
                 float eps,

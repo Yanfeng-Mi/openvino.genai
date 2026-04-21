@@ -3,6 +3,7 @@
 
 #include "modeling/ops/nn.hpp"
 
+#include <openvino/op/mvn.hpp>
 #include <openvino/op/interpolate.hpp>
 #include <openvino/opsets/opset13.hpp>
 #include <ov_ops/rms.hpp>
@@ -172,6 +173,31 @@ Tensor layer_norm(const Tensor& input,
                   float eps,
                   int64_t axis) {
     return layer_norm(input, weight, nullptr, eps, axis);
+}
+
+Tensor layer_norm_mvn(const Tensor& input,
+                      const Tensor& weight,
+                      const Tensor* bias,
+                      float eps,
+                      int64_t axis) {
+    auto* ctx = resolve_context(input, weight);
+    auto orig_dtype = input.dtype();
+    auto x = input.to(ov::element::f32);
+    auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {axis});
+    auto mvn = std::make_shared<ov::op::v6::MVN>(
+        x.output(), axes, true, eps, ov::op::MVNEpsMode::INSIDE_SQRT);
+    auto out = Tensor(mvn->output(0), ctx).to(orig_dtype) * weight;
+    if (bias) {
+        out = out + *bias;
+    }
+    return out;
+}
+
+Tensor layer_norm_mvn(const Tensor& input,
+                      const Tensor& weight,
+                      float eps,
+                      int64_t axis) {
+    return layer_norm_mvn(input, weight, nullptr, eps, axis);
 }
 
 Tensor rms_norm(const Tensor& input,

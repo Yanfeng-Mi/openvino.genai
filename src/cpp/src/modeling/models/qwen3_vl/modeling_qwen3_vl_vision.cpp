@@ -8,11 +8,14 @@
 
 #include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
+#include <openvino/op/cum_sum.hpp>
+#include <openvino/op/reduce_prod.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/nn.hpp"
 #include "modeling/ops/ops.hpp"
+#include "modeling/ops/tensor_ops.hpp"
 #include "modeling/weights/weight_loader.hpp"
 
 namespace {
@@ -29,6 +32,20 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+ov::genai::modeling::Tensor build_cu_seq_lens_from_grid_thw(const ov::genai::modeling::Tensor& grid_thw) {
+    auto* ctx = grid_thw.context();
+    auto reduce_axes = ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{1}), ctx);
+    auto token_counts = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v1::ReduceProd>(grid_thw.output(), reduce_axes.output(), false),
+        ctx);
+    auto axis = ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_scalar(ctx, int64_t(0)), ctx);
+    auto cumulative = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v0::CumSum>(token_counts.output(), axis.output(), false, false),
+        ctx);
+    auto zero = ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{0}), ctx);
+    return ov::genai::modeling::ops::concat({zero, cumulative}, 0).to(ov::element::i32);
+}
 
 }  // namespace
 
@@ -124,48 +141,57 @@ const Tensor* Qwen3VLVisionAttention::proj_bias() const {
 Tensor Qwen3VLVisionAttention::apply_rotary(const Tensor& x,
                                             const Tensor& cos,
                                             const Tensor& sin) const {
-    auto orig_dtype = x.dtype();
-    auto x_f = x.to(ov::element::f32);
-    auto cos_f = cos.to(ov::element::f32).unsqueeze(1);
-    auto sin_f = sin.to(ov::element::f32).unsqueeze(1);
-
+    auto* policy = &ctx().op_policy();
     const int64_t half = static_cast<int64_t>(head_dim_ / 2);
-    auto x1 = ops::slice(x_f, 0, half, 1, 2);
-    auto x2 = ops::slice(x_f, half, static_cast<int64_t>(head_dim_), 1, 2);
-    auto rotated = ops::concat({-x2, x1}, 2);
-
-    auto out = x_f * cos_f + rotated * sin_f;
-    return out.to(orig_dtype);
+    auto rope_cos = ops::slice(cos, 0, half, 1, 1).unsqueeze(1);
+    auto rope_sin = ops::slice(sin, 0, half, 1, 1).unsqueeze(1);
+    return ops::llm::apply_rope(x, rope_cos, rope_sin, head_dim_, policy);
 }
 
 Tensor Qwen3VLVisionAttention::forward(const Tensor& hidden_states,
                                        const Tensor& rotary_cos,
                                        const Tensor& rotary_sin,
-                                       const Tensor* attention_mask) const {
+                                       const Tensor* attention_mask,
+                                       const Tensor* cu_seq_lens) const {
     auto qkv = add_bias_if_present(ops::linear(hidden_states, qkv_weight()), qkv_bias());
     auto qkv_reshaped = qkv.reshape({0, 3, num_heads_, head_dim_});
-    auto q = ops::slice(qkv_reshaped, 0, 1, 1, 1).squeeze(1);
-    auto k = ops::slice(qkv_reshaped, 1, 2, 1, 1).squeeze(1);
-    auto v = ops::slice(qkv_reshaped, 2, 3, 1, 1).squeeze(1);
+    auto qkv_split = ops::tensor::split(qkv_reshaped, 3, 1);
+    auto q = qkv_split[0].squeeze(1);
+    auto k = qkv_split[1].squeeze(1);
+    auto v = qkv_split[2].squeeze(1);
 
     auto q_rot = apply_rotary(q, rotary_cos, rotary_sin);
     auto k_rot = apply_rotary(k, rotary_cos, rotary_sin);
 
-    auto q_heads = q_rot.permute({1, 0, 2}).unsqueeze(0);
-    auto k_heads = k_rot.permute({1, 0, 2}).unsqueeze(0);
-    auto v_heads = v.permute({1, 0, 2}).unsqueeze(0);
+    Tensor context;
+    if (cu_seq_lens) {
+        constexpr std::array<int64_t, 3> order_hsd = {1, 0, 2};
+        context = ops::llm::vlsdpa(q_rot,
+                                   k_rot,
+                                   v,
+                                   *cu_seq_lens,
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()));
+    } else {
+        auto q_heads = q_rot.permute({1, 0, 2}).unsqueeze(0);
+        auto k_heads = k_rot.permute({1, 0, 2}).unsqueeze(0);
+        auto v_heads = v.permute({1, 0, 2}).unsqueeze(0);
 
-    auto* policy = &ctx().op_policy();
-    const Tensor* mask_ptr = nullptr;
-    Tensor mask_4d;
-    if (attention_mask) {
-        mask_4d = attention_mask->unsqueeze(1);
-        mask_ptr = &mask_4d;
+        auto* policy = &ctx().op_policy();
+        const Tensor* mask_ptr = nullptr;
+        Tensor mask_4d;
+        if (attention_mask) {
+            mask_4d = attention_mask->unsqueeze(1);
+            mask_ptr = &mask_4d;
+        }
+        context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, mask_ptr, false, policy);
+        context = context.permute({0, 2, 1, 3}).reshape({0, 0, static_cast<int64_t>(hidden_size_)}).squeeze(0);
     }
-    auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, mask_ptr, false, policy);
+
     const int64_t attn_out_dim = static_cast<int64_t>(hidden_size_);
-    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
-    auto merged_2d = merged.squeeze(0);
+    auto merged_2d = cu_seq_lens ? context.reshape({0, attn_out_dim}) : context;
     auto out = add_bias_if_present(ops::linear(merged_2d, proj_weight()), proj_bias());
     return out;
 }
@@ -259,11 +285,12 @@ const Tensor& Qwen3VLVisionBlock::norm2_bias() const {
 Tensor Qwen3VLVisionBlock::forward(const Tensor& hidden_states,
                                    const Tensor& rotary_cos,
                                    const Tensor& rotary_sin,
-                                   const Tensor* attention_mask) const {
-    auto norm1 = ops::nn::layer_norm(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
-    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin, attention_mask);
+                                   const Tensor* attention_mask,
+                                   const Tensor* cu_seq_lens) const {
+    auto norm1 = ops::nn::layer_norm_mvn(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
+    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin, attention_mask, cu_seq_lens);
     auto resid1 = hidden_states + attn_out;
-    auto norm2 = ops::nn::layer_norm(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
+    auto norm2 = ops::nn::layer_norm_mvn(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
     auto mlp_out = mlp_.forward(norm2);
     return resid1 + mlp_out;
 }
@@ -325,9 +352,9 @@ Tensor Qwen3VLVisionPatchMerger::forward(const Tensor& hidden_states) const {
     Tensor x;
     if (use_postshuffle_norm_) {
         auto reshaped = hidden_states.reshape({-1, merged_hidden_size_});
-        x = ops::nn::layer_norm(reshaped, norm_weight(), &norm_bias(), eps_, -1);
+        x = ops::nn::layer_norm_mvn(reshaped, norm_weight(), &norm_bias(), eps_, -1);
     } else {
-        auto normed = ops::nn::layer_norm(hidden_states, norm_weight(), &norm_bias(), eps_, -1);
+        auto normed = ops::nn::layer_norm_mvn(hidden_states, norm_weight(), &norm_bias(), eps_, -1);
         x = normed.reshape({-1, merged_hidden_size_});
     }
     auto fc1 = add_bias_if_present(ops::linear(x, fc1_weight()), fc1_bias());
@@ -368,23 +395,26 @@ Qwen3VLVisionOutput Qwen3VLVisionModel::forward(const Tensor& pixel_values,
                                                 const Tensor& pos_embeds,
                                                 const Tensor& rotary_cos,
                                                 const Tensor& rotary_sin,
-                                                const Tensor* attention_mask) {
-    (void)grid_thw;
+                                                const Tensor* attention_mask,
+                                                const Tensor* cu_seq_lens) {
     auto hidden_states = patch_embed_.forward(pixel_values);
     hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype());
-    return forward_blocks(hidden_states, rotary_cos, rotary_sin, attention_mask);
+    auto derived_cu_seq_lens = cu_seq_lens ? Tensor{} : build_cu_seq_lens_from_grid_thw(grid_thw);
+    auto* cu_seq_lens_ptr = cu_seq_lens ? cu_seq_lens : &derived_cu_seq_lens;
+    return forward_blocks(hidden_states, rotary_cos, rotary_sin, attention_mask, cu_seq_lens_ptr);
 }
 
 Qwen3VLVisionOutput Qwen3VLVisionModel::forward_blocks(const Tensor& hidden_states_in,
                                                        const Tensor& rotary_cos,
                                                        const Tensor& rotary_sin,
-                                                       const Tensor* attention_mask) {
+                                                       const Tensor* attention_mask,
+                                                       const Tensor* cu_seq_lens) {
     Tensor hidden_states = hidden_states_in;
     Qwen3VLVisionOutput output;
     output.deepstack_embeds.reserve(deepstack_mergers_.size());
 
     for (size_t layer_idx = 0; layer_idx < blocks_.size(); ++layer_idx) {
-        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, attention_mask);
+        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, attention_mask, cu_seq_lens);
         auto it = std::find(deepstack_indexes_.begin(),
                             deepstack_indexes_.end(),
                             static_cast<int32_t>(layer_idx));
@@ -461,6 +491,10 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
     }
 
     return ctx.build_model(results);
+}
+
+void tag_qwen3_vl_vision_model_for_vlsdpa(std::shared_ptr<ov::Model> model) {
+    model->set_rt_info("QWenVL", "model_type_hint");
 }
 
 }  // namespace models

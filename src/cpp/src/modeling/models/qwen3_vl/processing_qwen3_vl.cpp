@@ -208,46 +208,82 @@ void resize_bilinear_to_chw(const uint8_t* src,
                             const std::array<float, 3>& mean,
                             const std::array<float, 3>& std,
                             std::vector<float>& dst_chw) {
-    dst_chw.assign(channels * dst_h * dst_w, 0.0f);
+    dst_chw.resize(channels * dst_h * dst_w);
     const float scale_y = static_cast<float>(src_h) / static_cast<float>(dst_h);
     const float scale_x = static_cast<float>(src_w) / static_cast<float>(dst_w);
 
-    auto fetch = [&](size_t y, size_t x, size_t c) -> float {
-        size_t idx = 0;
-        if (nchw) {
-            idx = (c * src_h + y) * src_w + x;
-        } else {
-            idx = (y * src_w + x) * channels + c;
-        }
-        return static_cast<float>(src[idx]);
-    };
+    // Precompute per-channel normalization constants: (1/255 - mean) / std → scale, -mean/std → offset
+    // norm = (v / 255 - mean) / std = v * (1 / (255 * std)) + (-mean / std)
+    std::array<float, 3> norm_scale{};
+    std::array<float, 3> norm_offset{};
+    for (size_t c = 0; c < channels && c < 3; ++c) {
+        norm_scale[c] = 1.0f / (255.0f * std[c]);
+        norm_offset[c] = -mean[c] / std[c];
+    }
 
+    // Precompute Y-axis interpolation params
+    struct YParam { size_t y0; size_t y1; float wy; };
+    std::vector<YParam> y_params(dst_h);
     for (size_t y = 0; y < dst_h; ++y) {
         float in_y = (static_cast<float>(y) + 0.5f) * scale_y - 0.5f;
         in_y = std::max(0.0f, std::min(in_y, static_cast<float>(src_h - 1)));
-        size_t y0 = static_cast<size_t>(std::floor(in_y));
-        size_t y1 = std::min(y0 + 1, src_h - 1);
-        float wy = in_y - static_cast<float>(y0);
-        for (size_t x = 0; x < dst_w; ++x) {
-            float in_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
-            in_x = std::max(0.0f, std::min(in_x, static_cast<float>(src_w - 1)));
-            size_t x0 = static_cast<size_t>(std::floor(in_x));
-            size_t x1 = std::min(x0 + 1, src_w - 1);
-            float wx = in_x - static_cast<float>(x0);
-            const float w00 = (1.0f - wy) * (1.0f - wx);
-            const float w01 = (1.0f - wy) * wx;
-            const float w10 = wy * (1.0f - wx);
-            const float w11 = wy * wx;
+        y_params[y].y0 = static_cast<size_t>(std::floor(in_y));
+        y_params[y].y1 = std::min(y_params[y].y0 + 1, src_h - 1);
+        y_params[y].wy = in_y - static_cast<float>(y_params[y].y0);
+    }
 
-            for (size_t c = 0; c < channels; ++c) {
-                float v = 0.0f;
-                v += w00 * fetch(y0, x0, c);
-                v += w01 * fetch(y0, x1, c);
-                v += w10 * fetch(y1, x0, c);
-                v += w11 * fetch(y1, x1, c);
-                const float norm = (v / 255.0f - mean[c]) / std[c];
-                const size_t out_idx = (c * dst_h + y) * dst_w + x;
-                dst_chw[out_idx] = norm;
+    // Precompute X-axis interpolation params
+    struct XParam { size_t x0; size_t x1; float wx; };
+    std::vector<XParam> x_params(dst_w);
+    for (size_t x = 0; x < dst_w; ++x) {
+        float in_x = (static_cast<float>(x) + 0.5f) * scale_x - 0.5f;
+        in_x = std::max(0.0f, std::min(in_x, static_cast<float>(src_w - 1)));
+        x_params[x].x0 = static_cast<size_t>(std::floor(in_x));
+        x_params[x].x1 = std::min(x_params[x].x0 + 1, src_w - 1);
+        x_params[x].wx = in_x - static_cast<float>(x_params[x].x0);
+    }
+
+    const size_t plane_size = dst_h * dst_w;
+
+    for (size_t y = 0; y < dst_h; ++y) {
+        const auto& yp = y_params[y];
+        const float w0y = 1.0f - yp.wy;
+        const float w1y = yp.wy;
+
+        // Pre-compute row base offsets for HWC layout (most common)
+        const size_t row0_base = nchw ? 0 : yp.y0 * src_w * channels;
+        const size_t row1_base = nchw ? 0 : yp.y1 * src_w * channels;
+
+        for (size_t x = 0; x < dst_w; ++x) {
+            const auto& xp = x_params[x];
+            const float w00 = w0y * (1.0f - xp.wx);
+            const float w01 = w0y * xp.wx;
+            const float w10 = w1y * (1.0f - xp.wx);
+            const float w11 = w1y * xp.wx;
+
+            if (nchw) {
+                for (size_t c = 0; c < channels; ++c) {
+                    const size_t c_plane = c * src_h;
+                    float v = w00 * static_cast<float>(src[(c_plane + yp.y0) * src_w + xp.x0])
+                            + w01 * static_cast<float>(src[(c_plane + yp.y0) * src_w + xp.x1])
+                            + w10 * static_cast<float>(src[(c_plane + yp.y1) * src_w + xp.x0])
+                            + w11 * static_cast<float>(src[(c_plane + yp.y1) * src_w + xp.x1]);
+                    dst_chw[c * plane_size + y * dst_w + x] = v * norm_scale[c] + norm_offset[c];
+                }
+            } else {
+                // HWC: all channels are contiguous at each pixel
+                const uint8_t* p00 = src + row0_base + xp.x0 * channels;
+                const uint8_t* p01 = src + row0_base + xp.x1 * channels;
+                const uint8_t* p10 = src + row1_base + xp.x0 * channels;
+                const uint8_t* p11 = src + row1_base + xp.x1 * channels;
+
+                for (size_t c = 0; c < channels; ++c) {
+                    float v = w00 * static_cast<float>(p00[c])
+                            + w01 * static_cast<float>(p01[c])
+                            + w10 * static_cast<float>(p10[c])
+                            + w11 * static_cast<float>(p11[c]);
+                    dst_chw[c * plane_size + y * dst_w + x] = v * norm_scale[c] + norm_offset[c];
+                }
             }
         }
     }
@@ -357,35 +393,32 @@ ov::Tensor build_pos_embeds(const ov::Tensor& pos_embed_weight,
             const float dh = h_lerp[static_cast<size_t>(yy)];
             const int64_t y0 = h_floor[static_cast<size_t>(yy)];
             const int64_t y1 = h_ceil[static_cast<size_t>(yy)];
-            const int64_t base_y0 = y0 * num_grid;
-            const int64_t base_y1 = y1 * num_grid;
+            const float w_y0 = 1.0f - dh;
+            // Pre-compute row pointers for the two Y neighbors
+            const float* row_y0 = weight + y0 * num_grid * hidden;
+            const float* row_y1 = weight + y1 * num_grid * hidden;
             for (int64_t xx = 0; xx < w; ++xx) {
                 const float dw = w_lerp[static_cast<size_t>(xx)];
                 const int64_t x0 = w_floor[static_cast<size_t>(xx)];
                 const int64_t x1 = w_ceil[static_cast<size_t>(xx)];
-                const float w00 = (1.0f - dh) * (1.0f - dw);
-                const float w01 = (1.0f - dh) * dw;
+                const float w00 = w_y0 * (1.0f - dw);
+                const float w01 = w_y0 * dw;
                 const float w10 = dh * (1.0f - dw);
                 const float w11 = dh * dw;
 
-                const int64_t idx00 = base_y0 + x0;
-                const int64_t idx01 = base_y0 + x1;
-                const int64_t idx10 = base_y1 + x0;
-                const int64_t idx11 = base_y1 + x1;
+                // Direct pointer access to 4-corner weight rows
+                const float* p00 = row_y0 + x0 * hidden;
+                const float* p01 = row_y0 + x1 * hidden;
+                const float* p10 = row_y1 + x0 * hidden;
+                const float* p11 = row_y1 + x1 * hidden;
 
-                const size_t out_base = static_cast<size_t>((yy * w + xx) * hidden);
-                const size_t w00_base = static_cast<size_t>(idx00 * hidden);
-                const size_t w01_base = static_cast<size_t>(idx01 * hidden);
-                const size_t w10_base = static_cast<size_t>(idx10 * hidden);
-                const size_t w11_base = static_cast<size_t>(idx11 * hidden);
+                float* dst = pos_hw.data() + static_cast<size_t>((yy * w + xx) * hidden);
 
                 for (int64_t hidx = 0; hidx < hidden; ++hidx) {
-                    float value = 0.0f;
-                    value += w00 * weight[w00_base + static_cast<size_t>(hidx)];
-                    value += w01 * weight[w01_base + static_cast<size_t>(hidx)];
-                    value += w10 * weight[w10_base + static_cast<size_t>(hidx)];
-                    value += w11 * weight[w11_base + static_cast<size_t>(hidx)];
-                    pos_hw[out_base + static_cast<size_t>(hidx)] = value;
+                    dst[hidx] = w00 * p00[hidx]
+                              + w01 * p01[hidx]
+                              + w10 * p10[hidx]
+                              + w11 * p11[hidx];
                 }
             }
         }
@@ -472,6 +505,33 @@ std::pair<ov::Tensor, ov::Tensor> build_rotary_cos_sin(
         const int64_t merged_h = h / merge_size;
         const int64_t merged_w = w / merge_size;
 
+        // Precompute cos/sin for each unique row and col coordinate.
+        // row ∈ [0, h), col ∈ [0, w). Each has inv_len frequency components.
+        // This replaces O(total_tokens × inv_len × 4_trig) with O((h + w) × inv_len × 2_trig).
+        const size_t inv_len_u = static_cast<size_t>(inv_len);
+        std::vector<float> row_cos_table(static_cast<size_t>(h) * inv_len_u);
+        std::vector<float> row_sin_table(static_cast<size_t>(h) * inv_len_u);
+        for (int64_t r = 0; r < h; ++r) {
+            float* rc = row_cos_table.data() + static_cast<size_t>(r) * inv_len_u;
+            float* rs = row_sin_table.data() + static_cast<size_t>(r) * inv_len_u;
+            for (int32_t j = 0; j < inv_len; ++j) {
+                const float freq = static_cast<float>(r) * inv_freq[static_cast<size_t>(j)];
+                rc[j] = std::cos(freq);
+                rs[j] = std::sin(freq);
+            }
+        }
+        std::vector<float> col_cos_table(static_cast<size_t>(w) * inv_len_u);
+        std::vector<float> col_sin_table(static_cast<size_t>(w) * inv_len_u);
+        for (int64_t c = 0; c < w; ++c) {
+            float* cc = col_cos_table.data() + static_cast<size_t>(c) * inv_len_u;
+            float* cs = col_sin_table.data() + static_cast<size_t>(c) * inv_len_u;
+            for (int32_t j = 0; j < inv_len; ++j) {
+                const float freq = static_cast<float>(c) * inv_freq[static_cast<size_t>(j)];
+                cc[j] = std::cos(freq);
+                cs[j] = std::sin(freq);
+            }
+        }
+
         for (int64_t tt = 0; tt < t; ++tt) {
             (void)tt;
             for (int64_t bh = 0; bh < merged_h; ++bh) {
@@ -483,22 +543,17 @@ std::pair<ov::Tensor, ov::Tensor> build_rotary_cos_sin(
                             float* cos_ptr = cos_out + offset * static_cast<size_t>(head_dim);
                             float* sin_ptr = sin_out + offset * static_cast<size_t>(head_dim);
 
+                            // Look up precomputed values instead of calling trig functions
+                            const float* rc = row_cos_table.data() + static_cast<size_t>(row) * inv_len_u;
+                            const float* rs = row_sin_table.data() + static_cast<size_t>(row) * inv_len_u;
+                            const float* cc = col_cos_table.data() + static_cast<size_t>(col) * inv_len_u;
+                            const float* cs = col_sin_table.data() + static_cast<size_t>(col) * inv_len_u;
+
                             for (int32_t j = 0; j < inv_len; ++j) {
-                                const float inv = inv_freq[static_cast<size_t>(j)];
-                                const float row_freq = static_cast<float>(row) * inv;
-                                const float col_freq = static_cast<float>(col) * inv;
-                                const float cos_row = std::cos(row_freq);
-                                const float sin_row = std::sin(row_freq);
-                                const float cos_col = std::cos(col_freq);
-                                const float sin_col = std::sin(col_freq);
-
-                                const int32_t row_idx = j;
-                                const int32_t col_idx = inv_len + j;
-
-                                cos_ptr[row_idx] = cos_row;
-                                sin_ptr[row_idx] = sin_row;
-                                cos_ptr[col_idx] = cos_col;
-                                sin_ptr[col_idx] = sin_col;
+                                cos_ptr[j] = rc[j];
+                                sin_ptr[j] = rs[j];
+                                cos_ptr[inv_len + j] = cc[j];
+                                sin_ptr[inv_len + j] = cs[j];
                             }
                             for (int32_t j = 0; j < rotary_dim; ++j) {
                                 cos_ptr[rotary_dim + j] = cos_ptr[j];

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -67,7 +68,10 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& beam_idx,
                    const Tensor& rope_cos,
-                   const Tensor& rope_sin) const;
+                   const Tensor& rope_sin,
+                   const Tensor* attention_mask = nullptr,
+                   const Tensor* precomputed_sdpa_mask = nullptr,
+                   std::optional<Tensor>* produced_sdpa_mask = nullptr) const;
 
 private:
     const Tensor& q_proj_weight() const;
@@ -131,7 +135,10 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& beam_idx,
                    const Tensor& rope_cos,
-                   const Tensor& rope_sin) const;
+                   const Tensor& rope_sin,
+                   const Tensor* attention_mask = nullptr,
+                   const Tensor* precomputed_sdpa_mask = nullptr,
+                   std::optional<Tensor>* produced_sdpa_mask = nullptr) const;
 
 private:
     Qwen3VLTextAttention self_attn_;
@@ -147,6 +154,7 @@ public:
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
                    const Tensor& beam_idx,
+                 const Tensor* attention_mask = nullptr,
                    const Tensor* visual_embeds = nullptr,
                    const Tensor* visual_pos_mask = nullptr,
                    const std::vector<Tensor>* deepstack_embeds = nullptr);
@@ -154,6 +162,7 @@ public:
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
+                     const Tensor* attention_mask = nullptr,
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr,
                           const std::vector<Tensor>* deepstack_embeds = nullptr);
@@ -180,6 +189,7 @@ public:
     Tensor forward(const Tensor& input_ids,
                    const Tensor& position_ids,
                    const Tensor& beam_idx,
+                 const Tensor* attention_mask = nullptr,
                    const Tensor* visual_embeds = nullptr,
                    const Tensor* visual_pos_mask = nullptr,
                    const std::vector<Tensor>* deepstack_embeds = nullptr);
@@ -187,6 +197,7 @@ public:
     Tensor forward_embeds(const Tensor& inputs_embeds,
                           const Tensor& position_ids,
                           const Tensor& beam_idx,
+                     const Tensor* attention_mask = nullptr,
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr,
                           const std::vector<Tensor>* deepstack_embeds = nullptr);

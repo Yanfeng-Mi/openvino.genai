@@ -4,6 +4,7 @@
 #include "modeling/ops/rope.hpp"
 
 #include <openvino/core/except.hpp>
+#include <openvino/op/non_zero.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/ops.hpp"
@@ -37,6 +38,37 @@ ov::genai::modeling::Tensor tensor_and(const ov::genai::modeling::Tensor& a,
     auto* ctx = a.context();
     auto node = std::make_shared<ov::op::v1::LogicalAnd>(a.output(), b.output(), ov::op::AutoBroadcastType::NUMPY);
     return ov::genai::modeling::Tensor(node, ctx);
+}
+
+ov::genai::modeling::Tensor flatten_rows(const ov::genai::modeling::Tensor& x) {
+    auto* ctx = x.context();
+    auto batch_dim = ov::genai::modeling::Tensor(ov::genai::modeling::shape::dim(x, 0), ctx);
+    auto seq_dim = ov::genai::modeling::Tensor(ov::genai::modeling::shape::dim(x, 1), ctx);
+    auto rows_dim = batch_dim * seq_dim;
+    auto dim = ov::genai::modeling::shape::dim(x, 2);
+    auto flat_shape = ov::genai::modeling::shape::make({rows_dim.output(), dim});
+    return x.reshape(flat_shape, false);
+}
+
+ov::genai::modeling::Tensor scatter_positions(const ov::genai::modeling::Tensor& base,
+                                              const ov::genai::modeling::Tensor& source,
+                                              const ov::genai::modeling::Tensor& mask_1d) {
+    auto* ctx = base.context();
+    auto non_zero = std::make_shared<ov::op::v3::NonZero>(mask_1d.output(), ov::element::i64);
+    ov::genai::modeling::Tensor nz(non_zero, ctx);
+    auto scatter_indices = nz.transpose({1, 0});
+    auto gather_indices = scatter_indices.squeeze(1);
+
+    auto flat_base = flatten_rows(base);
+    auto flat_source = flatten_rows(source);
+    auto base_t = flat_base.transpose({1, 0});
+    auto source_t = flat_source.transpose({1, 0});
+    auto updates = ov::genai::modeling::ops::gather(source_t, gather_indices, 0);
+    auto scatter = std::make_shared<ov::op::v3::ScatterNDUpdate>(base_t.output(),
+                                                                 scatter_indices.output(),
+                                                                 updates.output());
+    auto updated_t = ov::genai::modeling::Tensor(scatter, ctx);
+    return updated_t.transpose({1, 0}).reshape(ov::genai::modeling::shape::of(base), false);
 }
 
 }  // namespace
@@ -76,13 +108,13 @@ Tensor mrope_interleaved(const Tensor& freqs, const std::vector<int32_t>& mrope_
         auto h_limit = Tensor(ops::const_scalar(ctx, h_len), ctx);
         auto in_h = tensor_less(idx, h_limit);
         auto mask_h = tensor_and(in_h, eq1);
-        out = ops::where(mask_h, h, out);
+        out = scatter_positions(out, h, mask_h);
     }
     if (w_len > 0) {
         auto w_limit = Tensor(ops::const_scalar(ctx, w_len), ctx);
         auto in_w = tensor_less(idx, w_limit);
         auto mask_w = tensor_and(in_w, eq2);
-        out = ops::where(mask_w, w, out);
+        out = scatter_positions(out, w, mask_w);
     }
     return out;
 }

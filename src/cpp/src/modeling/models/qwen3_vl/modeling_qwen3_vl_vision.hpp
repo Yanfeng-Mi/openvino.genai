@@ -67,7 +67,8 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& rotary_cos,
                    const Tensor& rotary_sin,
-                   const Tensor* attention_mask = nullptr) const;
+                   const Tensor* attention_mask = nullptr,
+                   const Tensor* cu_seq_lens = nullptr) const;
 
 private:
     const Tensor& qkv_weight() const;
@@ -117,7 +118,8 @@ public:
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& rotary_cos,
                    const Tensor& rotary_sin,
-                   const Tensor* attention_mask = nullptr) const;
+                   const Tensor* attention_mask = nullptr,
+                   const Tensor* cu_seq_lens = nullptr) const;
 
 private:
     const Tensor& norm1_weight() const;
@@ -175,14 +177,16 @@ public:
                                 const Tensor& pos_embeds,
                                 const Tensor& rotary_cos,
                                 const Tensor& rotary_sin,
-                                const Tensor* attention_mask = nullptr);
+                                const Tensor* attention_mask = nullptr,
+                                const Tensor* cu_seq_lens = nullptr);
 
     /// Run only the transformer blocks + merger/deepstack (no PatchEmbed).
     /// Used for VLMPipeline-compatible merger model export.
     Qwen3VLVisionOutput forward_blocks(const Tensor& hidden_states,
                                        const Tensor& rotary_cos,
                                        const Tensor& rotary_sin,
-                                       const Tensor* attention_mask = nullptr);
+                                       const Tensor* attention_mask = nullptr,
+                                       const Tensor* cu_seq_lens = nullptr);
 
     Qwen3VLVisionPatchEmbed& patch_embed();
     Qwen3VLVisionPatchMerger& merger();
@@ -200,6 +204,11 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_model(
     const Qwen3VLConfig& cfg,
     ov::genai::modeling::weights::WeightSource& source,
     ov::genai::modeling::weights::WeightFinalizer& finalizer);
+
+/// Tag a vision model for VLSDPA optimization. When compiled, the OV plugin
+/// may replace SDPA with VLSDPA and add compact cu_seq_lens inputs instead
+/// of a dense N² attention mask.
+void tag_qwen3_vl_vision_model_for_vlsdpa(std::shared_ptr<ov::Model> model);
 
 }  // namespace models
 }  // namespace modeling

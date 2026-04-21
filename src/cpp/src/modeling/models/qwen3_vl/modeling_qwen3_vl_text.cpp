@@ -4,12 +4,13 @@
 #include "modeling/models/qwen3_vl/modeling_qwen3_vl_text.hpp"
 
 #include <cmath>
+#include <cstdlib>
 
 #include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
-#include <openvino/op/util/variable.hpp>
-#include <openvino/opsets/opset13.hpp>
+#include <openvino/runtime/properties.hpp>
 
+#include "modeling/ops/kv_cache.hpp"
 #include "modeling/ops/llm.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/rope.hpp"
@@ -148,51 +149,17 @@ const Tensor* Qwen3VLTextAttention::o_proj_bias() const {
 std::pair<Tensor, Tensor> Qwen3VLTextAttention::append_kv_cache(const Tensor& keys,
                                                                 const Tensor& values,
                                                                 const Tensor& beam_idx) const {
-    auto* op_ctx = keys.context();
-    auto batch = shape::dim(keys, 0);
-    auto kv_heads = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(num_kv_heads_)});
-    auto zero_len = ops::const_vec(op_ctx, std::vector<int64_t>{0});
-    auto head_dim = ops::const_vec(op_ctx, std::vector<int64_t>{static_cast<int64_t>(head_dim_)});
-    auto cache_shape = shape::make({batch, kv_heads, zero_len, head_dim});
-
-    auto zero = Tensor(ops::const_scalar(op_ctx, 0.0f), op_ctx).to(keys.dtype());
-    auto k_init = shape::broadcast_to(zero, cache_shape);
-    auto v_init = shape::broadcast_to(zero, cache_shape);
-
     const std::string cache_prefix = full_path().empty() ? name() : full_path();
-    const std::string k_name = cache_prefix + ".key_cache";
-    const std::string v_name = cache_prefix + ".value_cache";
-
-    ov::op::util::VariableInfo k_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
-                                      keys.dtype(),
-                                      k_name};
-    auto k_var = std::make_shared<ov::op::util::Variable>(k_info);
-    auto k_read = std::make_shared<ov::op::v6::ReadValue>(k_init.output(), k_var);
-
-    ov::op::util::VariableInfo v_info{ov::PartialShape{-1, num_kv_heads_, -1, head_dim_},
-                                      values.dtype(),
-                                      v_name};
-    auto v_var = std::make_shared<ov::op::util::Variable>(v_info);
-    auto v_read = std::make_shared<ov::op::v6::ReadValue>(v_init.output(), v_var);
-
-    auto k_cached = ops::gather(Tensor(k_read->output(0), op_ctx), beam_idx, 0);
-    auto v_cached = ops::gather(Tensor(v_read->output(0), op_ctx), beam_idx, 0);
-
-    auto k_combined = ops::concat({k_cached, keys}, 2);
-    auto v_combined = ops::concat({v_cached, values}, 2);
-
-    auto k_assign = std::make_shared<ov::opset13::Assign>(k_combined.output(), k_var);
-    auto v_assign = std::make_shared<ov::opset13::Assign>(v_combined.output(), v_var);
-    ctx().register_sink(k_assign);
-    ctx().register_sink(v_assign);
-
-    return {k_combined, v_combined};
+    return ops::append_kv_cache(keys, values, beam_idx, num_kv_heads_, head_dim_, cache_prefix, ctx());
 }
 
 Tensor Qwen3VLTextAttention::forward(const Tensor& hidden_states,
                                      const Tensor& beam_idx,
                                      const Tensor& rope_cos,
-                                     const Tensor& rope_sin) const {
+                                     const Tensor& rope_sin,
+                                     const Tensor* attention_mask,
+                                     const Tensor* precomputed_sdpa_mask,
+                                     std::optional<Tensor>* produced_sdpa_mask) const {
     auto q = add_bias_if_present(ops::linear(hidden_states, q_proj_weight()), q_proj_bias());
     auto k = add_bias_if_present(ops::linear(hidden_states, k_proj_weight()), k_proj_bias());
     auto v = add_bias_if_present(ops::linear(hidden_states, v_proj_weight()), v_proj_bias());
@@ -216,8 +183,20 @@ Tensor Qwen3VLTextAttention::forward(const Tensor& hidden_states,
     auto k_expanded = ops::llm::repeat_kv(cached.first, num_heads_, num_kv_heads_, head_dim_);
     auto v_expanded = ops::llm::repeat_kv(cached.second, num_heads_, num_kv_heads_, head_dim_);
 
-    auto mask = ops::llm::build_kv_causal_mask(q_rot, k_expanded);
-    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, &mask, false, policy);
+    const Tensor* sdpa_mask = precomputed_sdpa_mask;
+    std::optional<Tensor> local_mask;
+    if (!sdpa_mask) {
+        local_mask = attention_mask ? ops::llm::build_kv_causal_mask_with_attention(q_rot, cached.first, *attention_mask)
+                                    : ops::llm::build_kv_causal_mask(q_rot, cached.first);
+        if (produced_sdpa_mask && attention_mask) {
+            *produced_sdpa_mask = local_mask;
+            sdpa_mask = &produced_sdpa_mask->value();
+        } else {
+            sdpa_mask = &(*local_mask);
+        }
+    }
+
+    auto context = ops::llm::sdpa(q_rot, k_expanded, v_expanded, scaling_, 3, sdpa_mask, false, policy);
     const int64_t attn_out_dim = static_cast<int64_t>(num_heads_) * head_dim_;
     auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
     auto out = add_bias_if_present(ops::linear(merged, o_proj_weight()), o_proj_bias());
@@ -283,9 +262,18 @@ Qwen3VLTextDecoderLayer::Qwen3VLTextDecoderLayer(BuilderContext& ctx,
 Tensor Qwen3VLTextDecoderLayer::forward(const Tensor& hidden_states,
                                         const Tensor& beam_idx,
                                         const Tensor& rope_cos,
-                                        const Tensor& rope_sin) const {
+                                        const Tensor& rope_sin,
+                                        const Tensor* attention_mask,
+                                        const Tensor* precomputed_sdpa_mask,
+                                        std::optional<Tensor>* produced_sdpa_mask) const {
     auto normed = input_layernorm_.forward(hidden_states);
-    auto attn_out = self_attn_.forward(normed, beam_idx, rope_cos, rope_sin);
+    auto attn_out = self_attn_.forward(normed,
+                                       beam_idx,
+                                       rope_cos,
+                                       rope_sin,
+                                       attention_mask,
+                                       precomputed_sdpa_mask,
+                                       produced_sdpa_mask);
     auto residual = hidden_states + attn_out;
     auto post_norm = post_attention_layernorm_.forward(residual);
     auto mlp_out = mlp_.forward(post_norm);
@@ -350,26 +338,50 @@ std::pair<Tensor, Tensor> Qwen3VLTextModel::build_mrope_cos_sin(const Tensor& po
 Tensor Qwen3VLTextModel::forward(const Tensor& input_ids,
                                  const Tensor& position_ids,
                                  const Tensor& beam_idx,
+                                 const Tensor* attention_mask,
                                  const Tensor* visual_embeds,
                                  const Tensor* visual_pos_mask,
                                  const std::vector<Tensor>* deepstack_embeds) {
     auto hidden_states = embed_tokens_.forward(input_ids);
-    return forward_embeds(hidden_states, position_ids, beam_idx, visual_embeds, visual_pos_mask, deepstack_embeds);
+    return forward_embeds(hidden_states,
+                          position_ids,
+                          beam_idx,
+                          attention_mask,
+                          visual_embeds,
+                          visual_pos_mask,
+                          deepstack_embeds);
 }
 
 Tensor Qwen3VLTextModel::forward_embeds(const Tensor& inputs_embeds,
                                         const Tensor& position_ids,
                                         const Tensor& beam_idx,
+                                        const Tensor* attention_mask,
                                         const Tensor* visual_embeds,
                                         const Tensor* visual_pos_mask,
                                         const std::vector<Tensor>* deepstack_embeds) {
     auto cos_sin = build_mrope_cos_sin(position_ids);
+
     Tensor hidden_states = inputs_embeds;
     if (visual_embeds && visual_pos_mask) {
         hidden_states = embedding_injector_.forward(hidden_states, *visual_embeds, *visual_pos_mask);
     }
+
+    std::optional<Tensor> shared_sdpa_mask;
+    const Tensor* precomputed_sdpa_mask = nullptr;
+
     for (size_t layer_idx = 0; layer_idx < layers_.size(); ++layer_idx) {
-        hidden_states = layers_[layer_idx].forward(hidden_states, beam_idx, cos_sin.first, cos_sin.second);
+        std::optional<Tensor>* produced_sdpa_mask =
+            (!precomputed_sdpa_mask && attention_mask) ? &shared_sdpa_mask : nullptr;
+        hidden_states = layers_[layer_idx].forward(hidden_states,
+                                                   beam_idx,
+                                                   cos_sin.first,
+                                                   cos_sin.second,
+                                                   attention_mask,
+                                                   precomputed_sdpa_mask,
+                                                   produced_sdpa_mask);
+        if (!precomputed_sdpa_mask && shared_sdpa_mask) {
+            precomputed_sdpa_mask = &(*shared_sdpa_mask);
+        }
         if (deepstack_embeds && visual_pos_mask && layer_idx < deepstack_embeds->size()) {
             hidden_states = deepstack_injector_.forward(hidden_states,
                                                        *visual_pos_mask,
@@ -405,22 +417,31 @@ Qwen3VLTextForCausalLM::Qwen3VLTextForCausalLM(BuilderContext& ctx,
 Tensor Qwen3VLTextForCausalLM::forward(const Tensor& input_ids,
                                        const Tensor& position_ids,
                                        const Tensor& beam_idx,
+                                       const Tensor* attention_mask,
                                        const Tensor* visual_embeds,
                                        const Tensor* visual_pos_mask,
                                        const std::vector<Tensor>* deepstack_embeds) {
-    auto hidden = model_.forward(input_ids, position_ids, beam_idx, visual_embeds, visual_pos_mask, deepstack_embeds);
+    auto hidden = model_.forward(input_ids,
+                                 position_ids,
+                                 beam_idx,
+                                 attention_mask,
+                                 visual_embeds,
+                                 visual_pos_mask,
+                                 deepstack_embeds);
     return lm_head_.forward(hidden);
 }
 
 Tensor Qwen3VLTextForCausalLM::forward_embeds(const Tensor& inputs_embeds,
                                               const Tensor& position_ids,
                                               const Tensor& beam_idx,
+                                              const Tensor* attention_mask,
                                               const Tensor* visual_embeds,
                                               const Tensor* visual_pos_mask,
                                               const std::vector<Tensor>* deepstack_embeds) {
     auto hidden = model_.forward_embeds(inputs_embeds,
                                         position_ids,
                                         beam_idx,
+                                        attention_mask,
                                         visual_embeds,
                                         visual_pos_mask,
                                         deepstack_embeds);
@@ -465,8 +486,6 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
                                   ov::element::i32,
                                   ov::PartialShape{-1});
 
-    (void)attention_mask;
-
     const Tensor* visual_embeds_ptr = nullptr;
     const Tensor* visual_pos_mask_ptr = nullptr;
     std::vector<Tensor> deepstack_inputs;
@@ -505,6 +524,7 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
         logits = model.forward_embeds(inputs_embeds,
                                       position_ids,
                                       beam_idx,
+                                      &attention_mask,
                                       visual_embeds_ptr,
                                       visual_pos_mask_ptr,
                                       deepstack_ptr);
@@ -515,6 +535,7 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
         logits = model.forward(input_ids,
                                position_ids,
                                beam_idx,
+                               &attention_mask,
                                visual_embeds_ptr,
                                visual_pos_mask_ptr,
                                deepstack_ptr);
@@ -522,7 +543,10 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_model(
 
     auto result = std::make_shared<ov::op::v0::Result>(logits.output());
     set_name(result, Qwen3VLTextIO::kLogits);
-    return ctx.build_model({result->output(0)});
+    auto ov_model = ctx.build_model({result->output(0)});
+    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
+    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
+    return ov_model;
 }
 
 }  // namespace models

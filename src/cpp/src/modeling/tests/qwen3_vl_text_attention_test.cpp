@@ -20,7 +20,7 @@
 
 namespace test_utils = ov::genai::modeling::tests;
 
-TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
+TEST(Qwen3VLTextAttention, MatchesReferenceNoRopeWithAttentionMask) {
     ov::genai::modeling::BuilderContext ctx;
 
     const size_t batch = 1;
@@ -83,8 +83,9 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
     auto rotary_sin = ctx.parameter("rotary_sin", ov::element::f32,
                                     ov::PartialShape{batch, seq_len, head_dim / 2});
     auto beam_idx = ctx.parameter("beam_idx", ov::element::i32, ov::PartialShape{batch});
+    auto attention_mask = ctx.parameter("attention_mask", ov::element::i64, ov::PartialShape{batch, seq_len});
 
-    auto output = attn.forward(hidden_states, beam_idx, rotary_cos, rotary_sin);
+    auto output = attn.forward(hidden_states, beam_idx, rotary_cos, rotary_sin, &attention_mask);
     auto ov_model = ctx.build_model({output.output()});
 
 
@@ -115,6 +116,10 @@ TEST(Qwen3VLTextAttention, MatchesReferenceNoRope) {
     ov::Tensor beam_tensor(ov::element::i32, {batch});
     std::fill_n(beam_tensor.data<int32_t>(), batch, 0);
     request.set_input_tensor(3, beam_tensor);
+
+    ov::Tensor attention_mask_tensor(ov::element::i64, {batch, seq_len});
+    std::fill_n(attention_mask_tensor.data<int64_t>(), attention_mask_tensor.get_size(), 1);
+    request.set_input_tensor(4, attention_mask_tensor);
 
     request.infer();
 

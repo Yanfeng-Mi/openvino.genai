@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/scatter_nd_update.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/rope.hpp"
@@ -23,6 +24,16 @@ std::shared_ptr<ov::Model> build_model_from_output(const ov::Output<ov::Node>& o
     return std::make_shared<ov::Model>(ov::OutputVector{result}, params);
 }
 
+size_t count_scatter_nd_update(const std::shared_ptr<ov::Model>& model) {
+    size_t count = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::v3::ScatterNDUpdate>(node)) {
+            ++count;
+        }
+    }
+    return count;
+}
+
 }  // namespace
 
 TEST(RopeOps, MropeInterleaved) {
@@ -34,6 +45,8 @@ TEST(RopeOps, MropeInterleaved) {
     std::vector<int32_t> section{0, 1, 1};
     auto out = ov::genai::modeling::ops::rope::mrope_interleaved(freqs, section);
     auto model = build_model_from_output(out.output(), {param});
+
+    EXPECT_GE(count_scatter_nd_update(model), 2u);
 
     std::vector<float> input_data = {
         0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 5.0f,

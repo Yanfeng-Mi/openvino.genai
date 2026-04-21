@@ -38,16 +38,30 @@ Tensor causal_mask(const Tensor& scores);
 // K shape [batch, heads, kv_len, head_dim]. Returns mask [batch, 1, q_len, kv_len].
 // For decode step: q_len=1, mask allows attending to all cached + current positions.
 Tensor build_kv_causal_mask(const Tensor& q, const Tensor& k);
+Tensor build_kv_padding_mask_from_attention(const Tensor& attention_mask);
 // Build causal mask with attention_mask integration for NPU/NPUW compatibility.
 // attention_mask: [batch, kv_len] where 1=attend, 0=mask (padding).
 // The attention_mask is incorporated into the causal mask to handle padding correctly.
-Tensor build_kv_causal_mask_with_attention(const Tensor& q, const Tensor& k, const Tensor& attention_mask);
-// Build the same causal+padding mask shape as build_kv_causal_mask_with_attention(), but from q_len and attention_mask.
-// q_len should be scalar or shape [1], and attention_mask is [batch, kv_len].
-Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len, const Tensor& attention_mask);
+Tensor build_kv_causal_mask_with_attention(const Tensor& q,
+                                           const Tensor& k,
+                                           const Tensor& attention_mask,
+                                           const Tensor* precomputed_padding_mask = nullptr);
+// Build the same causal+padding mask shape as build_kv_causal_mask_with_attention(), but from q_len, kv_len, and attention_mask.
+// q_len and kv_len should be scalar or shape [1], and attention_mask is [batch, kv_len].
+Tensor build_kv_causal_mask_with_attention_from_q_len(const Tensor& q_len,
+                                                      const Tensor& kv_len,
+                                                      const Tensor& attention_mask);
 // Helpers for handling qk_head_dim != v_head_dim in SDPA.
 Tensor pad_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim);
 Tensor slice_to_head_dim(const Tensor& x, int32_t head_dim, int32_t target_head_dim);
+Tensor vlsdpa(const Tensor& q,
+              const Tensor& k,
+              const Tensor& v,
+              const Tensor& cu_seq_lens,
+              const std::vector<int64_t>& order_q = {},
+              const std::vector<int64_t>& order_k = {},
+              const std::vector<int64_t>& order_v = {},
+              const std::vector<int64_t>& order_out = {});
 Tensor sdpa(const Tensor& q,
             const Tensor& k,
             const Tensor& v,

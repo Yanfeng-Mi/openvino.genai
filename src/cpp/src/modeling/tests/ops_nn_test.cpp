@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/mvn.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/nn.hpp"
@@ -168,6 +169,38 @@ TEST(OpsNN, LayerNorm) {
 
     auto out = ov::genai::modeling::ops::nn::layer_norm(x, w, &b, 1e-5f, -1);
     auto model = build_model_from_output(out.output(), {param});
+
+    std::vector<float> input_data{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
+    ov::Tensor input_tensor(ov::element::f32, shape);
+    std::memcpy(input_tensor.data(), input_data.data(), input_data.size() * sizeof(float));
+    auto expected = layer_norm_ref(input_data, weight_data, bias_data, 2, 3, 1e-5f);
+    run_model_test(model, input_tensor, expected, test_utils::k_tol_default);
+}
+
+TEST(OpsNN, LayerNormMvn) {
+    ov::genai::modeling::OpContext ctx;
+    const ov::Shape shape{1, 2, 3};
+    auto param = std::make_shared<ov::op::v0::Parameter>(ov::element::f32, shape);
+    ov::genai::modeling::Tensor x(param, &ctx);
+
+    std::vector<float> weight_data{1.0f, 0.5f, 2.0f};
+    std::vector<float> bias_data{0.1f, -0.2f, 0.3f};
+    auto weight = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{3}, weight_data);
+    auto bias = ov::op::v0::Constant::create(ov::element::f32, ov::Shape{3}, bias_data);
+    ov::genai::modeling::Tensor w(weight, &ctx);
+    ov::genai::modeling::Tensor b(bias, &ctx);
+
+    auto out = ov::genai::modeling::ops::nn::layer_norm_mvn(x, w, &b, 1e-5f, -1);
+    auto model = build_model_from_output(out.output(), {param});
+
+    size_t mvn_count = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::v6::MVN>(node)) {
+            ++mvn_count;
+        }
+    }
+
+    EXPECT_EQ(mvn_count, 1u);
 
     std::vector<float> input_data{1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f};
     ov::Tensor input_tensor(ov::element::f32, shape);

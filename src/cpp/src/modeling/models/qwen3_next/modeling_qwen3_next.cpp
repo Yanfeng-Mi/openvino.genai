@@ -797,8 +797,9 @@ Tensor Qwen3NextModel::forward(const Tensor& input_ids,
 
     auto* op_ctx = input_ids.context();
     auto q_len_1d = Tensor(shape::dim(input_ids, 1), op_ctx);
+    auto kv_len_1d = Tensor(shape::dim(full_attention_mask, 1), op_ctx);
     auto shared_full_attn_sdpa_mask =
-        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, full_attention_mask);
+        ops::llm::build_kv_causal_mask_with_attention_from_q_len(q_len_1d, kv_len_1d, full_attention_mask);
 
     std::optional<Tensor> residual;
     for (auto& layer : layers_) {
