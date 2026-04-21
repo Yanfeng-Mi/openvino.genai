@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <filesystem>
 #include <type_traits>
 #include <optional>
 #include <stdexcept>
@@ -183,6 +184,10 @@ ov::Tensor push_front_inputs(const ov::Tensor& base_tensor, int64_t add_to_front
 bool env_setup_for_print_debug_info();
 
 void print_compiled_model_properties(ov::CompiledModel& compiled_Model, const char* model_title);
+
+std::optional<std::filesystem::path> get_runtime_model_dump_dir();
+
+void dump_runtime_model_if_requested(const ov::CompiledModel& compiled_model, const std::string& file_stem);
 
 void print_gguf_debug_info(const std::string& debug_info);
 

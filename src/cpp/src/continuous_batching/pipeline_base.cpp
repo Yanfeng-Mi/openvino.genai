@@ -303,13 +303,21 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         const auto& prompt = prompts[0];
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
 
+        const auto vision_encode_start = std::chrono::steady_clock::now();
         encoded_images = m_inputs_embedder->encode_images(images_vector[0]);
         m_history_images.insert(m_history_images.end(), encoded_images.begin(), encoded_images.end());
 
         encoded_videos = m_inputs_embedder->encode_videos(videos_vector[0]);
         m_history_videos.insert(m_history_videos.end(), encoded_videos.begin(), encoded_videos.end());
+        const auto vision_encode_end = std::chrono::steady_clock::now();
+        vlm_perf_metrics[0].vlm_raw_metrics.vision_encode_durations.emplace_back(
+            PerfMetrics::get_microsec(vision_encode_end - vision_encode_start));
 
+        const auto prompt_normalize_start = std::chrono::steady_clock::now();
         auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+        const auto prompt_normalize_end = std::chrono::steady_clock::now();
+        vlm_perf_metrics[0].vlm_raw_metrics.prompt_normalize_durations.emplace_back(
+            PerfMetrics::get_microsec(prompt_normalize_end - prompt_normalize_start));
 
         m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
         m_history_image_ids.insert(m_history_image_ids.end(), image_sequence.begin(), image_sequence.end());
@@ -361,10 +369,18 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
             
             auto images_to_encode = images_vector.size() > 0 ? images_vector[i] : std::vector<ov::Tensor>{};
             auto videos_to_encode = videos_vector.size() > 0 ? videos_vector[i] : std::vector<ov::Tensor>{};
+            const auto vision_encode_start = std::chrono::steady_clock::now();
             const auto encoded_images = m_inputs_embedder->encode_images(images_to_encode);
             const auto encoded_videos = m_inputs_embedder->encode_videos(videos_to_encode);
+            const auto vision_encode_end = std::chrono::steady_clock::now();
+            vlm_perf_metrics[i].vlm_raw_metrics.vision_encode_durations.emplace_back(
+                PerfMetrics::get_microsec(vision_encode_end - vision_encode_start));
 
+            const auto prompt_normalize_start = std::chrono::steady_clock::now();
             auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+            const auto prompt_normalize_end = std::chrono::steady_clock::now();
+            vlm_perf_metrics[i].vlm_raw_metrics.prompt_normalize_durations.emplace_back(
+                PerfMetrics::get_microsec(prompt_normalize_end - prompt_normalize_start));
 
             m_inputs_embedder->set_apply_chat_template_status(sampling_params[i].apply_chat_template);
 
@@ -411,6 +427,10 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;
+        if (!gen_result.perf_metrics.raw_metrics.m_token_infer_durations.empty()) {
+            gen_result.perf_metrics.vlm_raw_metrics.prefill_inference_durations.emplace_back(
+                gen_result.perf_metrics.raw_metrics.m_token_infer_durations.front());
+        }
         
         auto decode_start_time = std::chrono::steady_clock::now();
         for (size_t idx = 0; idx < result.m_generation_ids.size(); ++idx) {
@@ -496,16 +516,24 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
                                                            generation_config.relevance_weight);
 
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
+        const auto vision_encode_start = std::chrono::steady_clock::now();
         
         VLMChatContext chat_context(histories[i], m_vision_registry, *m_inputs_embedder);
         chat_contexts.push_back(std::move(chat_context));
     
         auto processed_chat_data = chat_contexts[i].process(images_vector[i], videos_vector[i]);
+        const auto vision_encode_end = std::chrono::steady_clock::now();
+        vlm_perf_metrics[i].vlm_raw_metrics.vision_encode_durations.emplace_back(
+            PerfMetrics::get_microsec(vision_encode_end - vision_encode_start));
     
+        const auto prompt_normalize_start = std::chrono::steady_clock::now();
         std::string templated_history = m_tokenizer.apply_chat_template(
             processed_chat_data.normalized_history,
             true
         );
+        const auto prompt_normalize_end = std::chrono::steady_clock::now();
+        vlm_perf_metrics[i].vlm_raw_metrics.prompt_normalize_durations.emplace_back(
+            PerfMetrics::get_microsec(prompt_normalize_end - prompt_normalize_start));
     
         m_inputs_embedder->set_apply_chat_template_status(false);
     
@@ -557,6 +585,10 @@ ContinuousBatchingPipeline::IContinuousBatchingPipeline::generate(
         gen_result.perf_metrics.vlm_raw_metrics = vlm_perf_metrics[i].vlm_raw_metrics;
         gen_result.perf_metrics.raw_metrics.tokenization_durations = vlm_perf_metrics[i].raw_metrics.tokenization_durations;
         gen_result.perf_metrics.raw_metrics.detokenization_durations = vlm_perf_metrics[i].raw_metrics.detokenization_durations;
+        if (!gen_result.perf_metrics.raw_metrics.m_token_infer_durations.empty()) {
+            gen_result.perf_metrics.vlm_raw_metrics.prefill_inference_durations.emplace_back(
+                gen_result.perf_metrics.raw_metrics.m_token_infer_durations.front());
+        }
         
         auto decode_start_time = std::chrono::steady_clock::now();
         for (size_t idx = 0; idx < result.m_generation_ids.size(); ++idx) {

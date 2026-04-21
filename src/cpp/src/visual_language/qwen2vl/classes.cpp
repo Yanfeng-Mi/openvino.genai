@@ -637,6 +637,7 @@ std::unique_ptr<CircularBufferQueue<ov::InferRequest>> create_vision_encoder_ire
 
     auto model = patch_preprocess_into_model(model_org, image_mean, image_scale);
     auto compiled_model = utils::singleton_core().compile_model(model, device, config);
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "vlm_vision_embeddings_model_compiled");
     ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings model");
     return std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         compiled_model.get_property(ov::optimal_number_of_infer_requests),
@@ -932,6 +933,7 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
     utils::request_vl_sdpa_transformations(model);
 
     auto compiled_model = utils::singleton_core().compile_model(model, device, device_config);
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "vlm_vision_embeddings_merger_model_compiled");
 
     m_with_cu_seqlens_input = utils::check_vl_sdpa_transformations(compiled_model);
     ov::genai::utils::print_compiled_model_properties(compiled_model,
@@ -966,6 +968,7 @@ InputsEmbedderQwen2VL::InputsEmbedderQwen2VL(
         device,
         device_config
     );
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "vlm_vision_embeddings_merger_model_compiled");
 
     m_with_cu_seqlens_input = utils::check_vl_sdpa_transformations(compiled_model);
     ov::genai::utils::print_compiled_model_properties(compiled_model,

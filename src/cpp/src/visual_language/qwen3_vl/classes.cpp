@@ -256,6 +256,7 @@ InputsEmbedderQwen3VL::InputsEmbedderQwen3VL(
     auto pos_model = utils::singleton_core().read_model(
         model_dir / "openvino_vision_embeddings_pos_model.xml");
     auto pos_compiled = utils::singleton_core().compile_model(pos_model, device, device_config);
+    ov::genai::utils::dump_runtime_model_if_requested(pos_compiled, "vlm_vision_embeddings_pos_model_compiled");
     
     m_ireq_queue_vision_embeddings_pos = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         pos_compiled.get_property(ov::optimal_number_of_infer_requests),
@@ -277,6 +278,7 @@ InputsEmbedderQwen3VL::InputsEmbedderQwen3VL(
         utils::get_model_weights_pair(models_map, "vision_embeddings_pos");
     auto pos_model = utils::singleton_core().read_model(pos_model_str, pos_weights);
     auto pos_compiled = utils::singleton_core().compile_model(pos_model, device, device_config);
+    ov::genai::utils::dump_runtime_model_if_requested(pos_compiled, "vlm_vision_embeddings_pos_model_compiled");
     
     m_ireq_queue_vision_embeddings_pos = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         pos_compiled.get_property(ov::optimal_number_of_infer_requests),

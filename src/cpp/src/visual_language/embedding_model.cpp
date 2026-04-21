@@ -50,6 +50,7 @@ EmbeddingsModel::EmbeddingsModel(const std::filesystem::path& model_dir,
     merge_postprocess(m_model, scale_emb);
 
     ov::CompiledModel compiled_model = core.compile_model(m_model, device, properties);
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "vlm_text_embeddings_model_compiled");
     ov::genai::utils::print_compiled_model_properties(compiled_model, "text embeddings model");
     m_embeddings_requests_queue = init(compiled_model);
 }
@@ -65,6 +66,7 @@ EmbeddingsModel::EmbeddingsModel(const std::string& model,
     merge_postprocess(m_model, scale_emb);
 
     ov::CompiledModel compiled_model = core.compile_model(m_model, device, properties);
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "vlm_text_embeddings_model_compiled");
     m_embeddings_requests_queue = init(compiled_model);
 }
 

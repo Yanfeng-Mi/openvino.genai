@@ -152,10 +152,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
                     "Continuous batching: execution device is expected to be single CPU / single GPU / multi GPUs");
     const std::string execution_device = execution_devices[0];
 
-    //debuglog
-    if (0) {
-        ov::serialize(compiled_model.get_runtime_model(), "full_model_compiled.xml");
-    }
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "cb_language_model_compiled");
 
     ov::genai::utils::print_compiled_model_properties(compiled_model, "LLM with Paged Attention");
     ov::InferRequest infer_request = compiled_model.create_infer_request();
