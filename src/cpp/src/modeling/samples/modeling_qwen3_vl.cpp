@@ -343,7 +343,7 @@ int main(int argc, char* argv[]) try {
     core.get_versions("CPU");
 
     std::unique_ptr<ov::genai::safetensors::SafetensorsWeightSource> source;
-    auto& ensure_weight_source = [&]() -> ov::genai::safetensors::SafetensorsWeightSource& {
+    auto ensure_weight_source = [&]() -> ov::genai::safetensors::SafetensorsWeightSource& {
         if (!source) {
             auto data = ov::genai::safetensors::load_safetensors(model_dir);
             source = std::make_unique<ov::genai::safetensors::SafetensorsWeightSource>(std::move(data));
