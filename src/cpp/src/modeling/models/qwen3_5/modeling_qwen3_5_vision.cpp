@@ -4,10 +4,13 @@
 #include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 #include <openvino/openvino.hpp>
 #include <openvino/core/except.hpp>
+#include <openvino/op/cum_sum.hpp>
+#include <openvino/op/reduce_prod.hpp>
 #include <openvino/opsets/opset13.hpp>
 
 #include "modeling/ops/llm.hpp"
@@ -29,6 +32,21 @@ auto set_name = [](auto node, const std::string& name) {
     node->output(0).set_names({name});
     node->set_friendly_name(name);
 };
+
+ov::genai::modeling::Tensor build_cu_seq_lens_from_grid_thw(const ov::genai::modeling::Tensor& grid_thw) {
+    auto* ctx = grid_thw.context();
+    auto reduce_axes =
+        ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{1}), ctx);
+    auto token_counts = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v1::ReduceProd>(grid_thw.output(), reduce_axes.output(), false),
+        ctx);
+    auto axis = ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_scalar(ctx, int64_t(0)), ctx);
+    auto cumulative = ov::genai::modeling::Tensor(
+        std::make_shared<ov::op::v0::CumSum>(token_counts.output(), axis.output(), false, false),
+        ctx);
+    auto zero = ov::genai::modeling::Tensor(ov::genai::modeling::ops::const_vec(ctx, std::vector<int64_t>{0}), ctx);
+    return ov::genai::modeling::ops::concat({zero, cumulative}, 0).to(ov::element::i32);
+}
 
 }  // namespace
 
@@ -140,7 +158,8 @@ Tensor Qwen3_5VisionAttention::apply_rotary(const Tensor& x,
 
 Tensor Qwen3_5VisionAttention::forward(const Tensor& hidden_states,
                                        const Tensor& rotary_cos,
-                                       const Tensor& rotary_sin) const {
+                                       const Tensor& rotary_sin,
+                                       const Tensor* cu_seq_lens) const {
     auto qkv = add_bias_if_present(ops::linear(hidden_states, qkv_weight()), qkv_bias());
     auto qkv_reshaped = qkv.reshape({0, 3, num_heads_, head_dim_});
     auto q = ops::slice(qkv_reshaped, 0, 1, 1, 1).squeeze(1);
@@ -150,15 +169,29 @@ Tensor Qwen3_5VisionAttention::forward(const Tensor& hidden_states,
     auto q_rot = apply_rotary(q, rotary_cos, rotary_sin);
     auto k_rot = apply_rotary(k, rotary_cos, rotary_sin);
 
-    auto q_heads = q_rot.permute({1, 0, 2}).unsqueeze(0);
-    auto k_heads = k_rot.permute({1, 0, 2}).unsqueeze(0);
-    auto v_heads = v.permute({1, 0, 2}).unsqueeze(0);
+    Tensor context;
+    if (cu_seq_lens) {
+        constexpr std::array<int64_t, 3> order_hsd = {1, 0, 2};
+        context = ops::llm::vlsdpa(q_rot,
+                                   k_rot,
+                                   v,
+                                   *cu_seq_lens,
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()),
+                                   std::vector<int64_t>(order_hsd.begin(), order_hsd.end()));
+    } else {
+        auto q_heads = q_rot.permute({1, 0, 2}).unsqueeze(0);
+        auto k_heads = k_rot.permute({1, 0, 2}).unsqueeze(0);
+        auto v_heads = v.permute({1, 0, 2}).unsqueeze(0);
 
-    auto* policy = &ctx().op_policy();
-    auto context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, nullptr, false, policy);
+        auto* policy = &ctx().op_policy();
+        context = ops::llm::sdpa(q_heads, k_heads, v_heads, scaling_, 3, nullptr, false, policy);
+        context = context.permute({0, 2, 1, 3}).reshape({0, 0, static_cast<int64_t>(hidden_size_)}).squeeze(0);
+    }
+
     const int64_t attn_out_dim = static_cast<int64_t>(hidden_size_);
-    auto merged = context.permute({0, 2, 1, 3}).reshape({0, 0, attn_out_dim});
-    auto merged_2d = merged.squeeze(0);
+    auto merged_2d = cu_seq_lens ? context.reshape({0, attn_out_dim}) : context;
     auto out = add_bias_if_present(ops::linear(merged_2d, proj_weight()), proj_bias());
     return out;
 }
@@ -251,9 +284,10 @@ const Tensor& Qwen3_5VisionBlock::norm2_bias() const {
 
 Tensor Qwen3_5VisionBlock::forward(const Tensor& hidden_states,
                                    const Tensor& rotary_cos,
-                                   const Tensor& rotary_sin) const {
+                                   const Tensor& rotary_sin,
+                                   const Tensor* cu_seq_lens) const {
     auto norm1 = ops::nn::layer_norm(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
-    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin);
+    auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin, cu_seq_lens);
     auto resid1 = hidden_states + attn_out;
     auto norm2 = ops::nn::layer_norm(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
     auto mlp_out = mlp_.forward(norm2);
@@ -359,16 +393,18 @@ Qwen3_5VisionOutput Qwen3_5VisionModel::forward(const Tensor& pixel_values,
                                                 const Tensor& grid_thw,
                                                 const Tensor& pos_embeds,
                                                 const Tensor& rotary_cos,
-                                                const Tensor& rotary_sin) {
-    (void)grid_thw;
+                                                const Tensor& rotary_sin,
+                                                const Tensor* cu_seq_lens) {
     auto hidden_states = patch_embed_.forward(pixel_values);
     hidden_states = hidden_states + pos_embeds.to(hidden_states.dtype());
+    auto derived_cu_seq_lens = cu_seq_lens ? Tensor{} : build_cu_seq_lens_from_grid_thw(grid_thw);
+    auto* cu_seq_lens_ptr = cu_seq_lens ? cu_seq_lens : &derived_cu_seq_lens;
 
     Qwen3_5VisionOutput output;
     output.deepstack_embeds.reserve(deepstack_mergers_.size());
 
     for (size_t layer_idx = 0; layer_idx < blocks_.size(); ++layer_idx) {
-        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin);
+        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, cu_seq_lens_ptr);
         auto it = std::find(deepstack_indexes_.begin(),
                             deepstack_indexes_.end(),
                             static_cast<int32_t>(layer_idx));

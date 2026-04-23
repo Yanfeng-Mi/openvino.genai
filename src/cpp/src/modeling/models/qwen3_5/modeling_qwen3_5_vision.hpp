@@ -66,7 +66,8 @@ public:
 
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& rotary_cos,
-                   const Tensor& rotary_sin) const;
+                   const Tensor& rotary_sin,
+                   const Tensor* cu_seq_lens = nullptr) const;
 
 private:
     const Tensor& qkv_weight() const;
@@ -115,7 +116,8 @@ public:
 
     Tensor forward(const Tensor& hidden_states,
                    const Tensor& rotary_cos,
-                   const Tensor& rotary_sin) const;
+                   const Tensor& rotary_sin,
+                   const Tensor* cu_seq_lens = nullptr) const;
 
 private:
     const Tensor& norm1_weight() const;
@@ -172,7 +174,8 @@ public:
                                 const Tensor& grid_thw,
                                 const Tensor& pos_embeds,
                                 const Tensor& rotary_cos,
-                                const Tensor& rotary_sin);
+                                const Tensor& rotary_sin,
+                                const Tensor* cu_seq_lens = nullptr);
 
     Qwen3_5VisionPatchEmbed& patch_embed();
     Qwen3_5VisionPatchMerger& merger();
