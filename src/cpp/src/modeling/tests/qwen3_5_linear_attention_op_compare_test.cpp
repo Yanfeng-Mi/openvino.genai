@@ -244,12 +244,17 @@ TEST(Qwen3_5LinearAttentionOpCompare, BothPathsRegisterSameStates) {
         ScopedEnvVar env("OV_GENAI_USE_LINEAR_ATTENTION_OP", env_value.c_str());
         auto model = build_qwen3_5_linear_attn_model(cfg, 2);
 
-        bool has_conv = false, has_recurrent = false;
+        bool has_conv = false;
+        bool has_linear_attention_op = false;
+        bool has_recurrent = false;
         size_t read_count = 0, assign_count = 0;
 
         for (const auto& op : model->get_ops()) {
             if (op->get_type_name() == std::string("FusedConv")) {
                 has_conv = true;
+            }
+            if (op->get_type_name() == std::string("LinearAttention")) {
+                has_linear_attention_op = true;
             }
             if (auto read = ov::as_type_ptr<ov::op::v6::ReadValue>(op)) {
                 read_count++;
@@ -262,10 +267,17 @@ TEST(Qwen3_5LinearAttentionOpCompare, BothPathsRegisterSameStates) {
             }
         }
 
-        EXPECT_GE(read_count, 1u) << "env=" << env_value;
-        EXPECT_GE(assign_count, 1u) << "env=" << env_value;
         EXPECT_TRUE(has_conv) << "Missing conv state (env=" << env_value << ")";
-        EXPECT_TRUE(has_recurrent) << "Missing recurrent state (env=" << env_value << ")";
+
+        if (env_value == "1") {
+            // The fused path encapsulates recurrent state inside LinearAttention,
+            // so explicit ReadValue/Assign nodes are not required here.
+            EXPECT_TRUE(has_linear_attention_op) << "Missing LinearAttention op (env=" << env_value << ")";
+        } else {
+            EXPECT_GE(read_count, 1u) << "env=" << env_value;
+            EXPECT_GE(assign_count, 1u) << "env=" << env_value;
+            EXPECT_TRUE(has_recurrent) << "Missing recurrent state (env=" << env_value << ")";
+        }
     };
 
     check_states("1");

@@ -18,6 +18,7 @@
 #include <openvino/core/except.hpp>
 #include <openvino/openvino.hpp>
 
+#include "gguf_utils/rtn_quantize.hpp"
 #include "modeling/builder_context.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_moe.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
@@ -25,6 +26,7 @@
 #include "modeling/tests/test_utils.hpp"
 #include "modeling/weights/weight_loader.hpp"
 #include "modeling/weights/weight_source.hpp"
+#include "safetensors_utils/safetensors_weight_finalizer.hpp"
 
 namespace {
 
@@ -45,7 +47,8 @@ struct MoeShape {
 
 enum class RefMode {
     FP32,
-    INT4
+    INT4,
+    INT8_ASYM
 };
 
 enum class Int4RouteMode {
@@ -289,8 +292,46 @@ CpuRefWeights build_cpu_ref_weights(const MoeShape& s, RefMode mode) {
     const size_t h = static_cast<size_t>(s.hidden_size);
     constexpr size_t kGroup = 128;
 
-    OPENVINO_ASSERT((h % kGroup) == 0, "hidden_size must be divisible by 128 for INT4 test");
-    OPENVINO_ASSERT((i % kGroup) == 0, "moe_intermediate_size must be divisible by 128 for INT4 test");
+    OPENVINO_ASSERT((h % kGroup) == 0, "hidden_size must be divisible by 128 for quantized MoE test");
+    OPENVINO_ASSERT((i % kGroup) == 0, "moe_intermediate_size must be divisible by 128 for quantized MoE test");
+
+    if (mode == RefMode::INT8_ASYM) {
+        auto dequantize_int8_asym = [&](const std::vector<float>& weights,
+                                        size_t num_experts,
+                                        size_t out_features,
+                                        size_t in_features) {
+            const auto weight_tensor = make_f32_tensor_from_f32(weights, {num_experts, out_features, in_features});
+            const auto q = ov::genai::rtn::quantize_int8_asym(weight_tensor, static_cast<int>(kGroup));
+
+            const auto scale_shape = q.scale.get_shape();
+            OPENVINO_ASSERT(scale_shape.size() == 3, "Expected 3D scale tensor for INT8 MoE ref");
+            const size_t num_groups = scale_shape[2];
+
+            const auto* q_data = q.compressed.data<const uint8_t>();
+            const auto* scale_data = q.scale.data<const ov::float16>();
+            const auto* zp_data = q.zero_point.data<const uint8_t>();
+
+            std::vector<float> dequantized(num_experts * out_features * in_features, 0.0f);
+            for (size_t ex = 0; ex < num_experts; ++ex) {
+                for (size_t row = 0; row < out_features; ++row) {
+                    for (size_t col = 0; col < in_features; ++col) {
+                        const size_t value_idx = ((ex * out_features) + row) * in_features + col;
+                        const size_t group_idx = std::min(col / kGroup, num_groups - 1);
+                        const size_t scale_idx = ((ex * out_features) + row) * num_groups + group_idx;
+                        dequantized[value_idx] =
+                            (static_cast<float>(q_data[value_idx]) - static_cast<float>(zp_data[scale_idx])) *
+                            static_cast<float>(scale_data[scale_idx]);
+                    }
+                }
+            }
+            return dequantized;
+        };
+
+        w.gate_proj = dequantize_int8_asym(raw_gate, e, i, h);
+        w.up_proj = dequantize_int8_asym(raw_up, e, i, h);
+        w.down_proj = dequantize_int8_asym(raw_down, e, h, i);
+        return w;
+    }
 
     const auto q_gate = quantize_q41(raw_gate, e, i, h, kGroup);
     const auto q_up = quantize_q41(raw_up, e, i, h, kGroup);
@@ -581,6 +622,67 @@ TEST_F(Qwen3_5MoeCoreULT, FusedAndOpsetOutputsStayConsistentOnGpu) {
     const auto stats = compare_tensors(out_opset, out_fused);
     EXPECT_LE(stats.max_abs, 1.2f);
     EXPECT_LE(stats.mean_abs, 0.2f);
+}
+
+TEST_F(Qwen3_5MoeCoreULT, FusedMoeInt8AsymWithSafetensorsFinalizerMatchesCpuRefOnGpu) {
+    skip_if_no_gpu();
+    const auto shape = make_fused_ref_shape();
+    if (shape.num_experts < 32) {
+        GTEST_SKIP() << "Fused MoE GPU test requires num_experts >= 32 for stable kernel path.";
+    }
+    if (shape.batch * shape.seq_len != 1) {
+        GTEST_SKIP() << "Fused MoE ULT is restricted to single-token shape (batch*seq==1) to avoid unstable multi-token path.";
+    }
+
+    const auto input = make_input_tensor(shape, 0x505u);
+    const auto ref_weights = build_cpu_ref_weights(shape, RefMode::INT8_ASYM);
+    const auto expected = build_qwen35_moe_cpu_ref(shape, input, ref_weights);
+
+    DeterministicMoeWeightSource source(shape);
+    ov::genai::modeling::weights::QuantizationConfig qcfg;
+    qcfg.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+    qcfg.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+    qcfg.group_size = 128;
+    qcfg.selection.include_patterns = {"*mlp.experts.*"};
+    qcfg.selection.exclude_patterns.clear();
+
+    ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(qcfg);
+    auto model = build_qwen3_5_moe_only_model(shape, source, finalizer);
+    ASSERT_TRUE(model_contains_internal_fused_moe(model));
+
+    auto out = run_model_on_gpu(model, input);
+    expect_tensor_near(out, expected, k_tol_moe);
+}
+
+TEST_F(Qwen3_5MoeCoreULT, FusedMoeInt8AsymMultiTokenPrefillMatchesCpuRefOnGpu) {
+    skip_if_no_gpu();
+
+    auto shape = make_ref_shape();
+    if (shape.num_experts < 32) {
+        GTEST_SKIP() << "Fused MoE GPU test requires num_experts >= 32 for stable kernel path.";
+    }
+    if (shape.batch * shape.seq_len == 1) {
+        shape.seq_len = 4;
+    }
+
+    const auto input = make_input_tensor(shape, 0x606u);
+    const auto ref_weights = build_cpu_ref_weights(shape, RefMode::INT8_ASYM);
+    const auto expected = build_qwen35_moe_cpu_ref(shape, input, ref_weights);
+
+    DeterministicMoeWeightSource source(shape);
+    ov::genai::modeling::weights::QuantizationConfig qcfg;
+    qcfg.mode = ov::genai::modeling::weights::QuantizationConfig::Mode::INT8_ASYM;
+    qcfg.backup_mode = ov::genai::modeling::weights::QuantizationConfig::Mode::NONE;
+    qcfg.group_size = 128;
+    qcfg.selection.include_patterns = {"*mlp.experts.*"};
+    qcfg.selection.exclude_patterns.clear();
+
+    ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(qcfg);
+    auto model = build_qwen3_5_moe_only_model(shape, source, finalizer);
+    ASSERT_TRUE(model_contains_internal_fused_moe(model));
+
+    auto out = run_model_on_gpu(model, input);
+    expect_tensor_near(out, expected, k_tol_moe);
 }
 
 }  // namespace

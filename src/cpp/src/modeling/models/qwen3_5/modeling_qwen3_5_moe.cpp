@@ -95,6 +95,10 @@ std::pair<ov::Tensor, ov::Tensor> split_tensor_on_dim(const ov::Tensor& tensor, 
     return {first, second};
 }
 
+}  // namespace
+
+namespace {
+
 Tensor dequantize_packed_moe_weight(const Tensor& packed_weight,
                                     const Tensor& scales_e_g_o,
                                     const Tensor& zps_e_g_o,
@@ -108,7 +112,20 @@ Tensor dequantize_packed_moe_weight(const Tensor& packed_weight,
     auto scales_e_o_g = Tensor(std::make_shared<ov::op::v1::Transpose>(scales_e_g_o.output(), perm), op_ctx);
     auto zps_e_o_g = Tensor(std::make_shared<ov::op::v1::Transpose>(zps_e_g_o.output(), perm), op_ctx);
 
-    auto packed_f32 = packed_weight.to(ov::element::f32);
+    Tensor grouped_weight = packed_weight;
+    const auto weight_shape = packed_weight.output().get_shape();
+    if (weight_shape.size() == 3) {
+        const auto scale_shape = scales_e_o_g.output().get_shape();
+        OPENVINO_ASSERT(scale_shape.size() == 3, "Expected [E, O, G] auxiliary shape for grouped MoE dequantization");
+        const size_t num_groups = scale_shape[2];
+        OPENVINO_ASSERT(num_groups > 0 && (in_features % static_cast<int32_t>(num_groups)) == 0,
+                        "Unsupported grouped MoE shape for fallback dequantization");
+        grouped_weight = packed_weight.reshape({num_experts, out_features, static_cast<int32_t>(num_groups), in_features / static_cast<int32_t>(num_groups)}, false);
+    } else {
+        OPENVINO_ASSERT(weight_shape.size() == 4, "Expected rank-3 or rank-4 MoE weight tensor");
+    }
+
+    auto packed_f32 = grouped_weight.to(ov::element::f32);
     auto zps_f32 = zps_e_o_g.unsqueeze(-1).to(ov::element::f32);
     auto scales_f32 = scales_e_o_g.unsqueeze(-1).to(ov::element::f32);
 
@@ -267,11 +284,14 @@ bool Qwen3_5SparseMoeBlock::can_use_fused_path() const {
         return false;
     }
 
-    // Fused compressed MoE kernel expects packed expert weights.
+    // Fused compressed MoE accepts both rank-4 grouped tensors and rank-3 grouped INT8 tensors.
     const auto gate_rank = gate_weight_->output().get_shape().size();
     const auto up_rank = up_weight_->output().get_shape().size();
     const auto down_rank = down_expert_weights().output().get_shape().size();
-    return gate_rank == 4 && up_rank == 4 && down_rank == 4;
+    const bool supported_ranks = (gate_rank == 3 || gate_rank == 4) &&
+                                 (up_rank == 3 || up_rank == 4) &&
+                                 (down_rank == 3 || down_rank == 4);
+    return supported_ranks && gate_rank == up_rank && up_rank == down_rank;
 }
 
 size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
@@ -279,6 +299,12 @@ size_t Qwen3_5SparseMoeBlock::infer_group_size() const {
         const auto shape = gate_weight_->output().get_shape();
         if (shape.size() == 4 && shape[3] > 0) {
             return shape[3];
+        }
+    }
+    if (gate_scales_.has_value()) {
+        const auto shape = gate_scales_->output().get_shape();
+        if (shape.size() == 3 && shape[1] > 0 && hidden_size_ % static_cast<int32_t>(shape[1]) == 0) {
+            return static_cast<size_t>(hidden_size_ / static_cast<int32_t>(shape[1]));
         }
     }
     return 128;
@@ -292,23 +318,24 @@ Tensor Qwen3_5SparseMoeBlock::routed_fused(const Tensor& flat_f32) const {
     OPENVINO_ASSERT(down_scales_.has_value() && down_zps_.has_value(),
                     "Down expert scales/zps not loaded");
 
-    return ops::moe3gemm_fused_compressed(flat_f32,
-                                          gate_weight(),
-                                          *gate_weight_,
-                                          *gate_scales_,
-                                          *gate_zps_,
-                                          *up_weight_,
-                                          *up_scales_,
-                                          *up_zps_,
-                                          down_expert_weights(),
-                                          *down_scales_,
-                                          *down_zps_,
-                                          hidden_size_,
-                                          expert_intermediate_size_,
-                                          num_experts_,
-                                          top_k_,
-                                          infer_group_size(),
-                                          ov::element::f16);
+    auto router_logits = ops::matmul(flat_f32, gate_weight(), false, true);
+    return ops::moe3gemm_fused_compressed_with_router(flat_f32,
+                                                      router_logits,
+                                                      *gate_weight_,
+                                                      *gate_scales_,
+                                                      *gate_zps_,
+                                                      *up_weight_,
+                                                      *up_scales_,
+                                                      *up_zps_,
+                                                      down_expert_weights(),
+                                                      *down_scales_,
+                                                      *down_zps_,
+                                                      hidden_size_,
+                                                      expert_intermediate_size_,
+                                                      num_experts_,
+                                                      top_k_,
+                                                      infer_group_size(),
+                                                      ov::element::f16);
 }
 
 Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
@@ -351,7 +378,10 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
     const bool has_down_quant = down_scales_.has_value() && down_zps_.has_value();
 
     Tensor gate_exps_w, up_exps_w, down_exps_w;
-    if (has_gate_quant && gate_weight_->output().get_shape().size() == 4) {
+    const auto gate_rank = gate_weight_->output().get_shape().size();
+    const auto down_rank = down_expert_weights().output().get_shape().size();
+
+    if (has_gate_quant && (gate_rank == 3 || gate_rank == 4)) {
         gate_exps_w = dequantize_packed_moe_weight(*gate_weight_, *gate_scales_, *gate_zps_,
                                                    num_experts_, expert_intermediate_size_, hidden_size_);
         up_exps_w = dequantize_packed_moe_weight(*up_weight_, *up_scales_, *up_zps_,
@@ -363,7 +393,7 @@ Tensor Qwen3_5SparseMoeBlock::routed_fallback(const Tensor& flat_f32) const {
         OPENVINO_THROW("Gate/up expert weights not loaded for fallback path");
     }
 
-    if (has_down_quant && down_expert_weights().output().get_shape().size() == 4) {
+    if (has_down_quant && (down_rank == 3 || down_rank == 4)) {
         down_exps_w = dequantize_packed_moe_weight(down_expert_weights(),
                                                    *down_scales_,
                                                    *down_zps_,

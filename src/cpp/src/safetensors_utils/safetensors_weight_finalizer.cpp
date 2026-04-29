@@ -19,8 +19,6 @@
 #include <iostream>
 #include <chrono>
 #include <iomanip>
-#include <atomic>
-
 namespace ov {
 namespace genai {
 namespace safetensors {
@@ -778,7 +776,9 @@ ov::Output<ov::Node> SafetensorsWeightFinalizer::create_dequant_subgraph(
 }
 
 bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
-    // Match MoE weight patterns that need special handling (return INT4 + scales + zps)
+    const bool is_expert_weight = name.find("mlp.experts.") != std::string::npos;
+
+    // Match MoE weight patterns that need special handling (return compressed weight + scales + zps)
     //
     // Pattern 1: Qwen3-MoE per-expert weights (not yet fused):
     // - model.layers[X].mlp.experts.{i}.gate_proj.weight
@@ -794,10 +794,10 @@ bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
     // - model.layers[X].moe.up_exps.weight
     // - model.layers[X].moe.down_exps.weight
     //
-    // These all need create_moe_subgraph to return INT4 compressed + auxiliary scales/zps
+    // These all need create_moe_subgraph to return compressed weights + auxiliary scales/zps
     
     // Pattern 1: Per-expert weights (Qwen3-MoE native format)
-    if (name.find(".mlp.experts.") != std::string::npos) {
+    if (is_expert_weight) {
         // Check if it's an expert projection weight
         if (name.find("gate_proj.weight") != std::string::npos ||
             name.find("up_proj.weight") != std::string::npos ||
@@ -806,8 +806,8 @@ bool SafetensorsWeightFinalizer::is_moe_weight(const std::string& name) const {
         }
 
         // Packed format used by Qwen3.5-MoE (gate+up fused by expert).
-        if (name.find(".mlp.experts.gate_up_proj") != std::string::npos ||
-            name.find(".mlp.experts.down_proj") != std::string::npos) {
+        if (name.find("mlp.experts.gate_up_proj") != std::string::npos ||
+            name.find("mlp.experts.down_proj") != std::string::npos) {
             return true;
         }
     }
@@ -827,37 +827,34 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     // MoE weights can be:
     // - 2D per-expert: [out_features, in_features] - Qwen3-MoE native format
     // - 3D pre-fused: [num_experts, out_features, in_features] - GGUF-style
-    // Qwen3-MoE expects INT4 compressed weights + scales + zps in auxiliary
+    // Qwen3-style fused MoE path consumes compressed expert weights plus auxiliary scales/zps.
     OPENVINO_ASSERT(original_shape.size() == 2 || original_shape.size() == 3, 
                     "MoE original shape must be 2D or 3D, got: ", original_shape.size());
     
-    // Determine element type based on compressed type
-    ov::element::Type compressed_type = quant_result.compressed.get_element_type();
+    // Use the logical compressed type from RTN metadata. The physical storage tensor may still
+    // use U8 bytes for packed INT4 data, so quant_result.compressed.get_element_type() is not
+    // sufficient to distinguish INT4_ASYM from INT8_ASYM.
+    ov::element::Type compressed_type = quant_result.compressed_type;
     bool has_zero_point = quant_result.has_zero_point && quant_result.zero_point.get_size() > 0;
-    ov::element::Type elem_type;
-    
-    if (compressed_type == ov::element::u8) {
-        // INT4 packed in U8: use u4 for asymmetric, i4 for symmetric
-        elem_type = has_zero_point ? ov::element::u4 : ov::element::i4;
-    } else if (compressed_type == ov::element::u4) {
-        elem_type = ov::element::u4;
-    } else if (compressed_type == ov::element::i4) {
-        elem_type = ov::element::i4;
-    } else if (compressed_type == ov::element::i8) {
-        elem_type = ov::element::i8;
-    } else {
+    ov::element::Type elem_type = compressed_type;
+
+    if (elem_type != ov::element::u4 &&
+        elem_type != ov::element::i4 &&
+        elem_type != ov::element::u8 &&
+        elem_type != ov::element::i8) {
         OPENVINO_THROW("Unsupported compressed type for MoE dequantization: ", compressed_type);
     }
+
+    OPENVINO_ASSERT(has_zero_point,
+                    "MoE compressed path currently requires asymmetric quantization metadata; "
+                    "use INT4_ASYM or INT8_ASYM for ",
+                    name);
     
     ov::Shape scale_shape = quant_result.scale.get_shape();
     
     // Handle both 2D (per-expert) and 3D (fused) shapes
     size_t out_features, in_features, num_groups, group_size;
     ov::Shape packed_shape;
-    
-    // Static counters to print summary only once per type
-    static std::atomic<int> moe_2d_count{0};
-    static std::atomic<int> moe_3d_count{0};
     
     if (original_shape.size() == 2) {
         // Per-expert 2D shape: [out_features, in_features]
@@ -871,12 +868,6 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
         
         // Packed shape: [out_features, num_groups, group_size]
         packed_shape = ov::Shape{out_features, num_groups, group_size};
-        
-        // Print only once for 2D MoE weights
-        if (moe_2d_count.fetch_add(1) == 0) {
-            std::cout << "[MoE] First 2D per-expert weight: " << name 
-                      << ", shape=" << original_shape << ", type=" << elem_type << std::endl;
-        }
     } else {
         // Pre-fused 3D shape: [num_experts, out_features, in_features]
         size_t num_experts = original_shape[0];
@@ -890,12 +881,6 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
         
         // Packed shape: [num_experts, out_features, num_groups, group_size]
         packed_shape = ov::Shape{num_experts, out_features, num_groups, group_size};
-        
-        // Print only once for 3D MoE weights
-        if (moe_3d_count.fetch_add(1) == 0) {
-            std::cout << "[MoE] First 3D fused weight: " << name 
-                      << ", shape=" << original_shape << ", type=" << elem_type << std::endl;
-        }
     }
 
     const void* data_ptr = quant_result.compressed.data();
@@ -906,7 +891,7 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
     auto scale_const = std::make_shared<ov::op::v0::Constant>(quant_result.scale);
     scale_const->set_friendly_name(name + "_scale");
 
-    // Handle zero-point: pack from u8 to u4 if needed
+    // Handle zero-point: pack from u8 to u4 only for INT4_ASYM; INT8_ASYM keeps u8 storage.
     std::shared_ptr<ov::op::v0::Constant> zp_const;
     if (has_zero_point) {
         ov::element::Type zp_type = quant_result.zero_point.get_element_type();
@@ -925,8 +910,6 @@ ov::genai::modeling::weights::FinalizedWeight SafetensorsWeightFinalizer::create
             zp_const = std::make_shared<ov::op::v0::Constant>(quant_result.zero_point);
         }
         zp_const->set_friendly_name(name + "_zp");
-    } else {
-        OPENVINO_THROW("MoE weights require zero points for asymmetric quantization");
     }
 
     // Build auxiliary map with scales and zero-points

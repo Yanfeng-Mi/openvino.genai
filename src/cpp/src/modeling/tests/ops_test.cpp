@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
+#include "gguf_utils/rtn_quantize.hpp"
 #include "modeling/builder_context.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/tests/test_utils.hpp"
@@ -380,6 +381,146 @@ TEST(Ops, Moe3GemmFusedCompressed) {
                                         num_experts,
                                         top_k);
                                         
+    test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
+}
+
+TEST(Ops, Moe3GemmFusedCompressedWithRouterInt8Asym) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    constexpr size_t token_num = 8;
+    constexpr size_t hidden_size = 512;
+    constexpr size_t inter_size = 1024;
+    constexpr size_t num_experts = 8;
+    constexpr size_t top_k = 4;
+    constexpr size_t group_size = 128;
+
+    static_assert(hidden_size % group_size == 0, "hidden_size must be divisible by group_size");
+    static_assert(inter_size % group_size == 0, "inter_size must be divisible by group_size");
+
+    auto hidden_param = ctx.parameter("hidden", ov::element::f32, ov::Shape{token_num, hidden_size});
+
+    auto hidden_states = test_utils::random_f32(token_num * hidden_size, -0.5f, 0.5f, 101);
+    auto gate_inp = test_utils::random_f32(num_experts * hidden_size, -0.5f, 0.5f, 103);
+    auto gate_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 107);
+    auto up_w_f32 = test_utils::random_f32(num_experts * inter_size * hidden_size, -0.5f, 0.5f, 109);
+    auto down_w_f32 = test_utils::random_f32(num_experts * hidden_size * inter_size, -0.5f, 0.5f, 113);
+
+    auto gate_q = ov::genai::rtn::quantize_int8_asym(test_utils::make_tensor(gate_w_f32, {num_experts, inter_size, hidden_size}),
+                                                     static_cast<int>(group_size));
+    auto up_q = ov::genai::rtn::quantize_int8_asym(test_utils::make_tensor(up_w_f32, {num_experts, inter_size, hidden_size}),
+                                                   static_cast<int>(group_size));
+    auto down_q = ov::genai::rtn::quantize_int8_asym(test_utils::make_tensor(down_w_f32, {num_experts, hidden_size, inter_size}),
+                                                     static_cast<int>(group_size));
+
+    auto dequantize_int8_asym = [group_size](const ov::genai::rtn::QuantizedWeight& q,
+                                             size_t experts,
+                                             size_t out_features,
+                                             size_t in_features) {
+        const auto* q_data = q.compressed.data<const uint8_t>();
+        const auto* scale_data = q.scale.data<const ov::float16>();
+        const auto* zp_data = q.zero_point.data<const uint8_t>();
+        const size_t num_groups = q.scale.get_shape().back();
+
+        std::vector<float> dequantized(experts * out_features * in_features, 0.0f);
+        for (size_t expert = 0; expert < experts; ++expert) {
+            for (size_t row = 0; row < out_features; ++row) {
+                for (size_t col = 0; col < in_features; ++col) {
+                    const size_t value_idx = ((expert * out_features) + row) * in_features + col;
+                    const size_t group_idx = std::min(col / group_size, num_groups - 1);
+                    const size_t scale_idx = ((expert * out_features) + row) * num_groups + group_idx;
+                    dequantized[value_idx] =
+                        (static_cast<float>(q_data[value_idx]) - static_cast<float>(zp_data[scale_idx])) *
+                        static_cast<float>(scale_data[scale_idx]);
+                }
+            }
+        }
+        return dequantized;
+    };
+
+    auto transpose_eog_to_ego_f16 = [](const ov::Tensor& src) {
+        const auto& src_shape = src.get_shape();
+        OPENVINO_ASSERT(src_shape.size() == 3, "Expected [E, O, G] scale shape");
+        ov::Tensor dst(src.get_element_type(), {src_shape[0], src_shape[2], src_shape[1]});
+
+        const auto* src_data = src.data<const ov::float16>();
+        auto* dst_data = dst.data<ov::float16>();
+        for (size_t expert = 0; expert < src_shape[0]; ++expert) {
+            for (size_t out = 0; out < src_shape[1]; ++out) {
+                for (size_t group = 0; group < src_shape[2]; ++group) {
+                    dst_data[(expert * src_shape[2] + group) * src_shape[1] + out] =
+                        src_data[(expert * src_shape[1] + out) * src_shape[2] + group];
+                }
+            }
+        }
+        return dst;
+    };
+
+    auto transpose_eog_to_ego_u8 = [](const ov::Tensor& src) {
+        const auto& src_shape = src.get_shape();
+        OPENVINO_ASSERT(src_shape.size() == 3, "Expected [E, O, G] zero-point shape");
+        ov::Tensor dst(src.get_element_type(), {src_shape[0], src_shape[2], src_shape[1]});
+
+        const auto* src_data = src.data<const uint8_t>();
+        auto* dst_data = dst.data<uint8_t>();
+        for (size_t expert = 0; expert < src_shape[0]; ++expert) {
+            for (size_t out = 0; out < src_shape[1]; ++out) {
+                for (size_t group = 0; group < src_shape[2]; ++group) {
+                    dst_data[(expert * src_shape[2] + group) * src_shape[1] + out] =
+                        src_data[(expert * src_shape[1] + out) * src_shape[2] + group];
+                }
+            }
+        }
+        return dst;
+    };
+
+    auto gate_w_deq = dequantize_int8_asym(gate_q, num_experts, inter_size, hidden_size);
+    auto up_w_deq = dequantize_int8_asym(up_q, num_experts, inter_size, hidden_size);
+    auto down_w_deq = dequantize_int8_asym(down_q, num_experts, hidden_size, inter_size);
+
+    auto* op_ctx = &ctx.op_context();
+    auto gate_inp_const = ov::genai::modeling::ops::constant(test_utils::make_tensor(gate_inp, {num_experts, hidden_size}), op_ctx);
+    auto router_logits = ov::genai::modeling::ops::matmul(hidden_param, gate_inp_const, false, true);
+
+    auto out = ov::genai::modeling::ops::moe3gemm_fused_compressed_with_router(
+        hidden_param,
+        router_logits,
+        ov::genai::modeling::ops::constant(gate_q.compressed, op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_f16(gate_q.scale), op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_u8(gate_q.zero_point), op_ctx),
+        ov::genai::modeling::ops::constant(up_q.compressed, op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_f16(up_q.scale), op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_u8(up_q.zero_point), op_ctx),
+        ov::genai::modeling::ops::constant(down_q.compressed, op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_f16(down_q.scale), op_ctx),
+        ov::genai::modeling::ops::constant(transpose_eog_to_ego_u8(down_q.zero_point), op_ctx),
+        static_cast<int32_t>(hidden_size),
+        static_cast<int32_t>(inter_size),
+        static_cast<int32_t>(num_experts),
+        static_cast<int32_t>(top_k),
+        static_cast<int32_t>(group_size),
+        ov::element::f16);
+
+    auto model = ctx.build_model({out.output()});
+
+    ov::Core core;
+    auto compiled = core.compile_model(model, "GPU");
+    auto request = compiled.create_infer_request();
+
+    request.set_input_tensor(0, test_utils::make_tensor(hidden_states, {token_num, hidden_size}));
+    request.infer();
+
+    auto expected = test_utils::moe_ref(hidden_states,
+                                        gate_inp,
+                                        gate_w_deq,
+                                        up_w_deq,
+                                        down_w_deq,
+                                        1,
+                                        token_num,
+                                        hidden_size,
+                                        inter_size,
+                                        num_experts,
+                                        top_k);
+
     test_utils::expect_tensor_near(request.get_output_tensor(), expected, test_utils::k_tol_moe);
 }
 
