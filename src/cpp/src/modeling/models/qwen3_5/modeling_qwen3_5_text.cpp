@@ -939,6 +939,10 @@ Tensor Qwen3_5ForCausalLM::forward_embeds(const Tensor& inputs_embeds,
     return lm_head_.forward(hidden);
 }
 
+Qwen3_5Model& Qwen3_5ForCausalLM::model() {
+    return model_;
+}
+
 std::shared_ptr<ov::Model> create_qwen3_5_text_model(
     const Qwen3_5Config& cfg,
     ov::genai::modeling::weights::WeightSource& source,

@@ -297,6 +297,8 @@ public:
                           const Tensor* visual_embeds = nullptr,
                           const Tensor* visual_pos_mask = nullptr);
 
+    Qwen3_5Model& model();
+
 private:
     Qwen3_5TextModelConfig cfg_;
     Qwen3_5Model model_;

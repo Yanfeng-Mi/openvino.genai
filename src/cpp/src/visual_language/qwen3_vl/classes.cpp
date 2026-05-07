@@ -2,11 +2,43 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "visual_language/qwen3_vl/classes.hpp"
+
+#include <openvino/core/type/bfloat16.hpp>
+#include <openvino/core/type/float16.hpp>
+
 #include "utils.hpp"
 
 namespace ov::genai {
 
 namespace {
+
+ov::Tensor to_f32_tensor(const ov::Tensor& src) {
+    if (src.get_element_type() == ov::element::f32) {
+        return src;
+    }
+
+    ov::Tensor dst{ov::element::f32, src.get_shape()};
+    float* dst_data = dst.data<float>();
+    const size_t total = src.get_size();
+
+    if (src.get_element_type() == ov::element::f16) {
+        const auto* src_data = src.data<const ov::float16>();
+        for (size_t i = 0; i < total; ++i) {
+            dst_data[i] = static_cast<float>(src_data[i]);
+        }
+        return dst;
+    }
+
+    if (src.get_element_type() == ov::element::bf16) {
+        const auto* src_data = src.data<const ov::bfloat16>();
+        for (size_t i = 0; i < total; ++i) {
+            dst_data[i] = static_cast<float>(src_data[i]);
+        }
+        return dst;
+    }
+
+    OPENVINO_THROW("Unsupported position embedding tensor element type: ", src.get_element_type());
+}
 
 /**
  * @brief Calculates timestamps for video frames based on encoded video metadata.
@@ -345,7 +377,7 @@ ov::Tensor InputsEmbedderQwen3VL::get_interpolated_pos_embeds(
 
     vision_embeddings_pos.set_tensor("input", indices);
     vision_embeddings_pos.infer();
-    ov::Tensor pos_embeds = vision_embeddings_pos.get_output_tensor();
+    ov::Tensor pos_embeds = to_f32_tensor(vision_embeddings_pos.get_output_tensor());
 
     size_t num_positions = pos_embeds.get_shape()[1];
     size_t embed_dim = pos_embeds.get_shape()[2];
@@ -385,8 +417,8 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     auto [reordered_video_embeds, reordered_videos_grid_thw] = 
         qwen2_vl_utils::reorder_video_embeds_and_grid_thw(videos, videos_sequence);
     
-    ov::Tensor concatenated_embeds = 
-        qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds);
+    ov::Tensor concatenated_embeds = to_f32_tensor(
+        qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds));
     
     // Combined grid for position computation
     std::vector<std::array<size_t, 3>> combined_grid_thw;
@@ -424,7 +456,11 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     vision_embeddings_merger.infer();
     
     ov::Tensor vision_embeds = vision_embeddings_merger.get_tensor("last_hidden_state");
-    m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
+    try {
+        m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
+    } catch (const std::exception&) {
+        m_lm_extra_inputs["deepstack_visual_embeds"] = ov::Tensor();
+    }
     
     auto vision_embeds_shape = vision_embeds.get_shape();
     

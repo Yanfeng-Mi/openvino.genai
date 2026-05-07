@@ -1,7 +1,7 @@
 // Copyright (C) 2023-2026 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 
-#include "modeling/models/qwen3_vl/export_for_vlmpipeline.hpp"
+#include "modeling/models/qwen3_5/export_for_vlmpipeline.hpp"
 
 #include <cmath>
 #include <filesystem>
@@ -13,13 +13,12 @@
 #include <openvino/openvino.hpp>
 #include <openvino/op/result.hpp>
 #include <openvino/pass/serialize.hpp>
-#include <openvino/runtime/properties.hpp>
 #include <nlohmann/json.hpp>
 
 #include "modeling/builder_context.hpp"
-#include "modeling/models/qwen3_vl/modeling_qwen3_vl_text.hpp"
-#include "modeling/models/qwen3_vl/modeling_qwen3_vl_vision.hpp"
-#include "modeling/models/qwen3_vl/processing_qwen3_vl.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_text.hpp"
+#include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
+#include "modeling/models/qwen3_5/processing_qwen3_5.hpp"
 #include "modeling/module.hpp"
 #include "modeling/ops/ops.hpp"
 #include "modeling/ops/tensor.hpp"
@@ -68,19 +67,18 @@ namespace ov::genai::modeling::models {
 // 1. Vision Embeddings Model (PatchEmbed only)
 // =============================================================================
 
-std::shared_ptr<ov::Model> create_qwen3_vl_vision_embeddings_model(
-    const Qwen3VLConfig& cfg,
+std::shared_ptr<ov::Model> create_qwen3_5_vision_embeddings_model(
+    const Qwen3_5Config& cfg,
     weights::WeightSource& source,
     weights::WeightFinalizer& finalizer) {
 
     BuilderContext ctx;
-    // Create full vision model for weight loading, but only use PatchEmbed
-    Qwen3VLVisionModel model(ctx, cfg.vision);
+    Qwen3_5VisionModel model(ctx, cfg.vision);
     model.packed_mapping().rules.push_back({"model.", "", 0});
 
     weights::LoadOptions options;
     options.allow_unmatched = true;
-    options.allow_missing = true;  // Non-PatchEmbed weights may be missing
+    options.allow_missing = true;
     options.report_missing = false;
     options.report_unmatched = true;
     weights::load_model(model, source, finalizer, options);
@@ -95,7 +93,6 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_embeddings_model(
                                        ov::element::f32,
                                        ov::PartialShape{-1, channel_dim});
 
-    // Reshape to [N, C, T, P, P] for Conv3d PatchEmbed, then forward
     auto output = model.patch_embed().forward(hidden_states);
 
     auto result = std::make_shared<ov::op::v0::Result>(output.output());
@@ -107,13 +104,13 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_embeddings_model(
 // 2. Vision Merger Model (Blocks + Merger + DeepstackMergers)
 // =============================================================================
 
-std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
-    const Qwen3VLConfig& cfg,
+std::shared_ptr<ov::Model> create_qwen3_5_vision_merger_model(
+    const Qwen3_5Config& cfg,
     weights::WeightSource& source,
     weights::WeightFinalizer& finalizer) {
 
     BuilderContext ctx;
-    Qwen3VLVisionModel model(ctx, cfg.vision);
+    Qwen3_5VisionModel model(ctx, cfg.vision);
     model.packed_mapping().rules.push_back({"model.", "", 0});
 
     weights::LoadOptions options;
@@ -125,7 +122,6 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
 
     const int32_t head_dim = cfg.vision.head_dim();
 
-    // Inputs matching VLMPipeline's merger model I/O
     auto hidden_states = ctx.parameter("hidden_states",
                                         ov::element::f32,
                                         ov::PartialShape{-1, cfg.vision.hidden_size});
@@ -134,26 +130,23 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
                                          ov::element::f32,
                                          ov::PartialShape{-1, head_dim});
 
-    auto cu_seq_lens = ctx.parameter("cu_seq_lens",
-                                      ov::element::i32,
-                                      ov::PartialShape{-1});
+    auto attention_mask = ctx.parameter("attention_mask",
+                                         ov::element::f32,
+                                         ov::PartialShape{1, -1, -1});
 
-    // Compute cos/sin from rotary_pos_emb inside the graph
+    // Compute cos/sin from rotary_pos_emb
     auto rotary_cos = rotary_pos_emb.cos();
     auto rotary_sin = rotary_pos_emb.sin();
 
     // Run blocks + merger + deepstack via forward_blocks (no PatchEmbed)
-    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin, nullptr, &cu_seq_lens);
+    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin);
 
-    // Build results
     ov::OutputVector results;
 
-    // Primary output: last_hidden_state
     auto lhs_result = std::make_shared<ov::op::v0::Result>(output.visual_embeds.output());
     set_name(lhs_result, "last_hidden_state");
     results.push_back(lhs_result->output(0));
 
-    // Deepstack output: stack individual outputs into [num_layers, N, hidden_size]
     if (!output.deepstack_embeds.empty()) {
         auto stacked = ops::tensor::stack(output.deepstack_embeds, 0);
         auto ds_result = std::make_shared<ov::op::v0::Result>(stacked.output());
@@ -168,26 +161,21 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_merger_model(
 // 3. Vision Position Embedding Model (Lookup/Gather)
 // =============================================================================
 
-std::shared_ptr<ov::Model> create_qwen3_vl_vision_pos_model(
-    const Qwen3VLConfig& cfg,
+std::shared_ptr<ov::Model> create_qwen3_5_vision_pos_model(
+    const Qwen3_5Config& cfg,
     weights::WeightSource& source) {
 
     BuilderContext ctx;
 
-    // Locate pos_embed weight
     std::string pos_embed_name = resolve_pos_embed_name(source);
     const ov::Tensor& pos_weight_raw = source.get_tensor(pos_embed_name);
 
-    // pos_embed_weight: [num_position_embeddings, embed_dim]
     auto pos_weight = ops::constant(pos_weight_raw, &ctx.op_context());
 
-    // Input: 4 sets of corner indices for bilinear interpolation
-    // Shape: [4, num_positions]
     auto input_indices = ctx.parameter("input",
                                         ov::element::i64,
                                         ov::PartialShape{4, -1});
 
-    // Gather for each of 4 corners
     std::vector<Tensor> corner_embeds;
     corner_embeds.reserve(4);
     for (int64_t corner = 0; corner < 4; ++corner) {
@@ -196,7 +184,6 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_pos_model(
         corner_embeds.push_back(gathered);
     }
 
-    // Stack: [4, num_positions, embed_dim]
     auto output = ops::tensor::stack(corner_embeds, 0);
 
     auto result = std::make_shared<ov::op::v0::Result>(output.output());
@@ -208,14 +195,36 @@ std::shared_ptr<ov::Model> create_qwen3_vl_vision_pos_model(
 // 4. Text Embeddings Model (VocabEmbedding only)
 // =============================================================================
 
-std::shared_ptr<ov::Model> create_qwen3_vl_text_embeddings_model(
-    const Qwen3VLConfig& cfg,
+std::shared_ptr<ov::Model> create_qwen3_5_text_embeddings_model(
+    const Qwen3_5Config& cfg,
     weights::WeightSource& source,
     weights::WeightFinalizer& finalizer) {
 
     BuilderContext ctx;
-    Qwen3VLTextForCausalLM model(ctx, cfg.text);
-    model.packed_mapping().rules.push_back({"model.", "", 0});
+
+    Qwen3_5TextModelConfig text_cfg;
+    text_cfg.hidden_size = cfg.text.hidden_size;
+    text_cfg.vocab_size = cfg.text.vocab_size;
+    text_cfg.num_attention_heads = cfg.text.num_attention_heads;
+    text_cfg.num_key_value_heads = cfg.text.num_key_value_heads > 0 ? cfg.text.num_key_value_heads : cfg.text.num_attention_heads;
+    text_cfg.head_dim = cfg.text.resolved_head_dim();
+    text_cfg.intermediate_size = cfg.text.intermediate_size;
+    text_cfg.num_hidden_layers = cfg.text.num_hidden_layers;
+    text_cfg.layer_types = cfg.text.layer_types;
+    text_cfg.tie_word_embeddings = cfg.text.tie_word_embeddings;
+
+    Qwen3_5ForCausalLM model(ctx, text_cfg);
+
+    // Weight mapping for Qwen3.5
+    for (int32_t i = 0; i < text_cfg.num_hidden_layers; ++i) {
+        const std::string idx = std::to_string(i);
+        model.packed_mapping().rules.push_back(
+            {"model.language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+        model.packed_mapping().rules.push_back(
+            {"language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
+    }
+    model.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    model.packed_mapping().rules.push_back({"language_model.", "model.", 0});
 
     weights::LoadOptions options;
     options.allow_unmatched = true;
@@ -236,80 +245,25 @@ std::shared_ptr<ov::Model> create_qwen3_vl_text_embeddings_model(
 }
 
 // =============================================================================
-// 5. Language Model (Decoder + DeepstackInjector + LMHead)
+// 5. Language Model (Hybrid Attention Decoder + LMHead)
 // =============================================================================
 
-std::shared_ptr<ov::Model> create_qwen3_vl_language_model(
-    const Qwen3VLConfig& cfg,
+std::shared_ptr<ov::Model> create_qwen3_5_language_model(
+    const Qwen3_5Config& cfg,
     weights::WeightSource& source,
     weights::WeightFinalizer& finalizer) {
 
-    BuilderContext ctx;
-    Qwen3VLTextForCausalLM model(ctx, cfg.text);
-    model.packed_mapping().rules.push_back({"model.", "", 0});
-
-    weights::LoadOptions options;
-    options.allow_unmatched = true;
-    options.allow_missing = false;
-    options.report_missing = true;
-    options.report_unmatched = true;
-    weights::load_model(model, source, finalizer, options);
-
-    const int32_t hidden_size = cfg.text.hidden_size;
-    const size_t num_deepstack = cfg.vision.deepstack_visual_indexes.size();
-
-    // Inputs matching VLMPipeline language model I/O
-    auto inputs_embeds = ctx.parameter("inputs_embeds",
-                                        ov::element::f32,
-                                        ov::PartialShape{-1, -1, hidden_size});
-
-    auto attention_mask = ctx.parameter("attention_mask",
-                                         ov::element::i64,
-                                         ov::PartialShape{-1, -1});
-
-    auto position_ids = ctx.parameter("position_ids",
-                                       ov::element::i64,
-                                       ov::PartialShape{3, -1, -1});
-
-    auto beam_idx = ctx.parameter("beam_idx",
-                                   ov::element::i32,
-                                   ov::PartialShape{-1});
-
-    // VLMPipeline-specific visual inputs
-    auto deepstack_visual_embeds = ctx.parameter("deepstack_visual_embeds",
-                                                  ov::element::f32,
-                                                  ov::PartialShape{static_cast<int64_t>(num_deepstack), -1, hidden_size});
-
-    auto visual_pos_masks = ctx.parameter("visual_pos_masks",
-                                           ov::element::boolean,
-                                           ov::PartialShape{-1, -1});
-
-    // Slice deepstack into per-layer tensors
-    std::vector<Tensor> ds_slices;
-    ds_slices.reserve(num_deepstack);
-    for (size_t i = 0; i < num_deepstack; ++i) {
-        auto slice = ops::slice(deepstack_visual_embeds,
-                                static_cast<int64_t>(i),
-                                static_cast<int64_t>(i + 1),
-                                1, 0).squeeze(0);
-        ds_slices.push_back(slice);
-    }
-
-    // Forward: skip EmbeddingInjector (visual_embeds=nullptr), apply DeepstackInjector
-    auto logits = model.forward_embeds(inputs_embeds,
-                                       position_ids,
-                                       beam_idx,
-                                       &attention_mask,
-                                       nullptr,            // visual_embeds: skip EmbeddingInjector
-                                       &visual_pos_masks,  // needed for DeepstackInjector
-                                       &ds_slices);
-
-    auto result = std::make_shared<ov::op::v0::Result>(logits.output());
-    set_name(result, "logits");
-    auto ov_model = ctx.build_model({result->output(0)});
-    ov_model->set_rt_info(ov::element::f16, {"runtime_options", ov::hint::kv_cache_precision.name()});
-    ov_model->set_rt_info(8.0f, {"runtime_options", ov::hint::activations_scale_factor.name()});
-    return ov_model;
+    // Export language model with inputs_embeds mode, no visual inputs.
+    // VLMPipeline's InputsEmbedder handles the visual-text token merge externally,
+    // so the language model just receives pre-merged inputs_embeds.
+    //
+    // Phase 1: No per-layer DeepStack injection, no EmbeddingInjector.
+    // Model inputs: inputs_embeds [B, S, H], attention_mask [B, S],
+    //               position_ids [3, B, S] (MRoPE), beam_idx [B]
+    // Model outputs: logits [B, S, V]
+    return create_qwen3_5_text_model(cfg, source, finalizer,
+                                     /*use_inputs_embeds=*/true,
+                                     /*enable_visual_inputs=*/false);
 }
 
 // =============================================================================
@@ -318,11 +272,11 @@ std::shared_ptr<ov::Model> create_qwen3_vl_language_model(
 
 namespace {
 
-void generate_vlmpipeline_config(const Qwen3VLConfig& cfg,
+void generate_vlmpipeline_config(const Qwen3_5Config& cfg,
                                  const std::filesystem::path& output_dir) {
     nlohmann::json config;
-    config["model_type"] = "qwen3_vl";
-    config["architectures"] = nlohmann::json::array({"Qwen3VLForConditionalGeneration"});
+    config["model_type"] = "qwen3_5";
+    config["architectures"] = nlohmann::json::array({"Qwen3_5ForConditionalGeneration"});
     config["hidden_size"] = cfg.text.hidden_size;
 
     // Vision config
@@ -358,6 +312,15 @@ void generate_vlmpipeline_config(const Qwen3VLConfig& cfg,
     text_config["rope_theta"] = cfg.text.rope_theta;
     text_config["attention_bias"] = cfg.text.attention_bias;
     text_config["tie_word_embeddings"] = cfg.text.tie_word_embeddings;
+    text_config["partial_rotary_factor"] = cfg.text.partial_rotary_factor;
+    text_config["full_attention_interval"] = cfg.text.full_attention_interval;
+
+    // MRoPE config
+    nlohmann::json rope_config;
+    rope_config["mrope_interleaved"] = cfg.text.rope.mrope_interleaved;
+    rope_config["mrope_section"] = cfg.text.rope.mrope_section;
+    text_config["rope_scaling"] = rope_config;
+
     config["text_config"] = text_config;
 
     // Token IDs
@@ -371,14 +334,14 @@ void generate_vlmpipeline_config(const Qwen3VLConfig& cfg,
     out << config.dump(2);
 }
 
-void generate_preprocessor_config(const Qwen3VLConfig& cfg,
+void generate_preprocessor_config(const Qwen3_5Config& cfg,
                                   const std::filesystem::path& output_dir) {
     nlohmann::json preproc;
-    preproc["image_processor_type"] = "Qwen3VLImageProcessor";
+    preproc["image_processor_type"] = "Qwen3_5ImageProcessor";
 
     nlohmann::json size;
-    size["shortest_edge"] = 56 * 56;          // min_pixels
-    size["longest_edge"] = 28 * 28 * 1280;    // max_pixels
+    size["shortest_edge"] = 56 * 56;
+    size["longest_edge"] = 28 * 28 * 1280;
     preproc["size"] = size;
 
     preproc["patch_size"] = cfg.vision.patch_size;
@@ -402,22 +365,17 @@ void generate_preprocessor_config(const Qwen3VLConfig& cfg,
 // Main Export Function
 // =============================================================================
 
-void export_qwen3_vl_for_vlmpipeline(
+void export_qwen3_5_for_vlmpipeline(
     const std::filesystem::path& model_dir,
     const std::filesystem::path& output_dir,
-    const Qwen3VLExportOptions& options) {
+    const Qwen3_5ExportOptions& options) {
 
-    // Load configuration
-    auto cfg = Qwen3VLConfig::from_json_file(model_dir / "config.json");
+    auto cfg = Qwen3_5Config::from_json_file(model_dir / "config.json");
 
-    // Load safetensors weights
     auto data = ov::genai::safetensors::load_safetensors(model_dir);
     ov::genai::safetensors::SafetensorsWeightSource source(std::move(data));
 
-    // Create output directory
     std::filesystem::create_directories(output_dir);
-
-    ov::Core core;
 
     auto vision_quant_config = create_quantization_config(
         options.vision_quant_mode, options.vision_quant_group_size,
@@ -429,7 +387,7 @@ void export_qwen3_vl_for_vlmpipeline(
     // 1. Export vision_embeddings_model (PatchEmbed)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(vision_quant_config);
-        auto model = create_qwen3_vl_vision_embeddings_model(cfg, source, finalizer);
+        auto model = create_qwen3_5_vision_embeddings_model(cfg, source, finalizer);
         ov::serialize(model,
                       (output_dir / "openvino_vision_embeddings_model.xml").string(),
                       (output_dir / "openvino_vision_embeddings_model.bin").string());
@@ -438,7 +396,7 @@ void export_qwen3_vl_for_vlmpipeline(
     // 2. Export vision_embeddings_merger_model (Blocks + Merger + Deepstack)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(vision_quant_config);
-        auto model = create_qwen3_vl_vision_merger_model(cfg, source, finalizer);
+        auto model = create_qwen3_5_vision_merger_model(cfg, source, finalizer);
         ov::serialize(model,
                       (output_dir / "openvino_vision_embeddings_merger_model.xml").string(),
                       (output_dir / "openvino_vision_embeddings_merger_model.bin").string());
@@ -446,7 +404,7 @@ void export_qwen3_vl_for_vlmpipeline(
 
     // 3. Export vision_embeddings_pos_model (Position embedding lookup)
     {
-        auto model = create_qwen3_vl_vision_pos_model(cfg, source);
+        auto model = create_qwen3_5_vision_pos_model(cfg, source);
         ov::serialize(model,
                       (output_dir / "openvino_vision_embeddings_pos_model.xml").string(),
                       (output_dir / "openvino_vision_embeddings_pos_model.bin").string());
@@ -455,16 +413,16 @@ void export_qwen3_vl_for_vlmpipeline(
     // 4. Export text_embeddings_model (VocabEmbedding)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_config);
-        auto model = create_qwen3_vl_text_embeddings_model(cfg, source, finalizer);
+        auto model = create_qwen3_5_text_embeddings_model(cfg, source, finalizer);
         ov::serialize(model,
                       (output_dir / "openvino_text_embeddings_model.xml").string(),
                       (output_dir / "openvino_text_embeddings_model.bin").string());
     }
 
-    // 5. Export language_model (Decoder + DeepstackInjector + LMHead)
+    // 5. Export language_model (Hybrid Attention Decoder + LMHead)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_config);
-        auto model = create_qwen3_vl_language_model(cfg, source, finalizer);
+        auto model = create_qwen3_5_language_model(cfg, source, finalizer);
         ov::serialize(model,
                       (output_dir / "openvino_language_model.xml").string(),
                       (output_dir / "openvino_language_model.bin").string());
@@ -477,7 +435,9 @@ void export_qwen3_vl_for_vlmpipeline(
     // 7. Copy tokenizer files if present
     for (const auto& tokenizer_file : {"tokenizer.json", "tokenizer_config.json",
                                         "special_tokens_map.json", "vocab.json",
-                                        "merges.txt"}) {
+                                        "merges.txt", "openvino_tokenizer.xml",
+                                        "openvino_tokenizer.bin", "openvino_detokenizer.xml",
+                                        "openvino_detokenizer.bin"}) {
         auto src_path = model_dir / tokenizer_file;
         if (std::filesystem::exists(src_path)) {
             std::filesystem::copy_file(src_path, output_dir / tokenizer_file,
@@ -490,7 +450,7 @@ void export_qwen3_vl_for_vlmpipeline(
 // In-memory serialization for ModelsMap
 // =============================================================================
 
-std::pair<std::string, ov::Tensor> serialize_model_to_memory(
+std::pair<std::string, ov::Tensor> serialize_qwen3_5_model_to_memory(
     const std::shared_ptr<ov::Model>& model) {
     std::ostringstream xml_stream;
     std::ostringstream bin_stream;
@@ -507,11 +467,11 @@ std::pair<std::string, ov::Tensor> serialize_model_to_memory(
     return {std::move(xml_str), std::move(weights)};
 }
 
-ModelsMap build_qwen3_vl_models_map(
+ModelsMap build_qwen3_5_models_map(
     const std::filesystem::path& model_dir,
-    const Qwen3VLExportOptions& options) {
+    const Qwen3_5ExportOptions& options) {
 
-    auto cfg = Qwen3VLConfig::from_json_file(model_dir / "config.json");
+    auto cfg = Qwen3_5Config::from_json_file(model_dir / "config.json");
 
     auto data = ov::genai::safetensors::load_safetensors(model_dir);
     ov::genai::safetensors::SafetensorsWeightSource source(std::move(data));
@@ -528,35 +488,35 @@ ModelsMap build_qwen3_vl_models_map(
     // 1. Vision embeddings (PatchEmbed)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(vision_quant_config);
-        auto model = create_qwen3_vl_vision_embeddings_model(cfg, source, finalizer);
-        models_map["vision_embeddings"] = serialize_model_to_memory(model);
+        auto model = create_qwen3_5_vision_embeddings_model(cfg, source, finalizer);
+        models_map["vision_embeddings"] = serialize_qwen3_5_model_to_memory(model);
     }
 
     // 2. Vision merger (Blocks + Merger + Deepstack)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(vision_quant_config);
-        auto model = create_qwen3_vl_vision_merger_model(cfg, source, finalizer);
-        models_map["vision_embeddings_merger"] = serialize_model_to_memory(model);
+        auto model = create_qwen3_5_vision_merger_model(cfg, source, finalizer);
+        models_map["vision_embeddings_merger"] = serialize_qwen3_5_model_to_memory(model);
     }
 
     // 3. Vision position embeddings (Gather lookup)
     {
-        auto model = create_qwen3_vl_vision_pos_model(cfg, source);
-        models_map["vision_embeddings_pos"] = serialize_model_to_memory(model);
+        auto model = create_qwen3_5_vision_pos_model(cfg, source);
+        models_map["vision_embeddings_pos"] = serialize_qwen3_5_model_to_memory(model);
     }
 
     // 4. Text embeddings (VocabEmbedding)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_config);
-        auto model = create_qwen3_vl_text_embeddings_model(cfg, source, finalizer);
-        models_map["text_embeddings"] = serialize_model_to_memory(model);
+        auto model = create_qwen3_5_text_embeddings_model(cfg, source, finalizer);
+        models_map["text_embeddings"] = serialize_qwen3_5_model_to_memory(model);
     }
 
-    // 5. Language model (Decoder + DeepstackInjector + LMHead)
+    // 5. Language model (Decoder + LMHead)
     {
         ov::genai::safetensors::SafetensorsWeightFinalizer finalizer(text_quant_config);
-        auto model = create_qwen3_vl_language_model(cfg, source, finalizer);
-        models_map["language"] = serialize_model_to_memory(model);
+        auto model = create_qwen3_5_language_model(cfg, source, finalizer);
+        models_map["language"] = serialize_qwen3_5_model_to_memory(model);
     }
 
     return models_map;

@@ -177,6 +177,11 @@ public:
                                 const Tensor& rotary_sin,
                                 const Tensor* cu_seq_lens = nullptr);
 
+    Qwen3_5VisionOutput forward_blocks(const Tensor& hidden_states,
+                                       const Tensor& rotary_cos,
+                                       const Tensor& rotary_sin,
+                                       const Tensor* cu_seq_lens = nullptr);
+
     Qwen3_5VisionPatchEmbed& patch_embed();
     Qwen3_5VisionPatchMerger& merger();
 

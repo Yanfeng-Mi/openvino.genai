@@ -400,11 +400,20 @@ Qwen3_5VisionOutput Qwen3_5VisionModel::forward(const Tensor& pixel_values,
     auto derived_cu_seq_lens = cu_seq_lens ? Tensor{} : build_cu_seq_lens_from_grid_thw(grid_thw);
     auto* cu_seq_lens_ptr = cu_seq_lens ? cu_seq_lens : &derived_cu_seq_lens;
 
+    return forward_blocks(hidden_states, rotary_cos, rotary_sin, cu_seq_lens_ptr);
+}
+
+Qwen3_5VisionOutput Qwen3_5VisionModel::forward_blocks(const Tensor& hidden_states_in,
+                                                       const Tensor& rotary_cos,
+                                                       const Tensor& rotary_sin,
+                                                       const Tensor* cu_seq_lens) {
+    Tensor hidden_states = hidden_states_in;
+
     Qwen3_5VisionOutput output;
     output.deepstack_embeds.reserve(deepstack_mergers_.size());
 
     for (size_t layer_idx = 0; layer_idx < blocks_.size(); ++layer_idx) {
-        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, cu_seq_lens_ptr);
+        hidden_states = blocks_[layer_idx].forward(hidden_states, rotary_cos, rotary_sin, cu_seq_lens);
         auto it = std::find(deepstack_indexes_.begin(),
                             deepstack_indexes_.end(),
                             static_cast<int32_t>(layer_idx));
