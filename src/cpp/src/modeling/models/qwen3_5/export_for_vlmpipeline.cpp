@@ -4,6 +4,7 @@
 #include "modeling/models/qwen3_5/export_for_vlmpipeline.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -59,6 +60,17 @@ std::string resolve_pos_embed_name(weights::WeightSource& source) {
     OPENVINO_THROW("Failed to locate visual.pos_embed.weight in safetensors");
 }
 
+void enable_zero_copy_safetensors_if_unset() {
+    if (std::getenv("OV_GENAI_USE_ZERO_COPY") != nullptr) {
+        return;
+    }
+#ifdef _WIN32
+    _putenv_s("OV_GENAI_USE_ZERO_COPY", "1");
+#else
+    setenv("OV_GENAI_USE_ZERO_COPY", "1", 0);
+#endif
+}
+
 }  // namespace
 
 namespace ov::genai::modeling::models {
@@ -108,6 +120,8 @@ std::shared_ptr<ov::Model> create_qwen3_5_vision_merger_model(
     const Qwen3_5Config& cfg,
     weights::WeightSource& source,
     weights::WeightFinalizer& finalizer) {
+
+    (void)cfg;
 
     BuilderContext ctx;
     Qwen3_5VisionModel model(ctx, cfg.vision);
@@ -202,42 +216,22 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_embeddings_model(
 
     BuilderContext ctx;
 
-    Qwen3_5TextModelConfig text_cfg;
-    text_cfg.hidden_size = cfg.text.hidden_size;
-    text_cfg.vocab_size = cfg.text.vocab_size;
-    text_cfg.num_attention_heads = cfg.text.num_attention_heads;
-    text_cfg.num_key_value_heads = cfg.text.num_key_value_heads > 0 ? cfg.text.num_key_value_heads : cfg.text.num_attention_heads;
-    text_cfg.head_dim = cfg.text.resolved_head_dim();
-    text_cfg.intermediate_size = cfg.text.intermediate_size;
-    text_cfg.num_hidden_layers = cfg.text.num_hidden_layers;
-    text_cfg.layer_types = cfg.text.layer_types;
-    text_cfg.tie_word_embeddings = cfg.text.tie_word_embeddings;
-
-    Qwen3_5ForCausalLM model(ctx, text_cfg);
-
-    // Weight mapping for Qwen3.5
-    for (int32_t i = 0; i < text_cfg.num_hidden_layers; ++i) {
-        const std::string idx = std::to_string(i);
-        model.packed_mapping().rules.push_back(
-            {"model.language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
-        model.packed_mapping().rules.push_back(
-            {"language_model.layers." + idx + ".", "model.layers[" + idx + "].", 0});
-    }
-    model.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
-    model.packed_mapping().rules.push_back({"language_model.", "model.", 0});
+    VocabEmbedding embed_tokens(ctx, "model.embed_tokens");
+    embed_tokens.packed_mapping().rules.push_back({"model.language_model.", "model.", 0});
+    embed_tokens.packed_mapping().rules.push_back({"language_model.", "model.", 0});
 
     weights::LoadOptions options;
     options.allow_unmatched = true;
-    options.allow_missing = true;
+    options.allow_missing = false;
     options.report_missing = false;
-    options.report_unmatched = true;
-    weights::load_model(model, source, finalizer, options);
+    options.report_unmatched = false;
+    weights::load_model(embed_tokens, source, finalizer, options);
 
     auto input_ids = ctx.parameter("input_ids",
                                     ov::element::i64,
                                     ov::PartialShape{-1, -1});
 
-    auto embeddings = model.model().embed_tokens().forward(input_ids);
+    auto embeddings = embed_tokens.forward(input_ids);
 
     auto result = std::make_shared<ov::op::v0::Result>(embeddings.output());
     set_name(result, "output");
@@ -259,7 +253,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_language_model(
     //
     // Phase 1: No per-layer DeepStack injection, no EmbeddingInjector.
     // Model inputs: inputs_embeds [B, S, H], attention_mask [B, S],
-    //               position_ids [3, B, S] (MRoPE), beam_idx [B]
+    //               position_ids [4, B, S] (text + MRoPE), beam_idx [B]
     // Model outputs: logits [B, S, V]
     return create_qwen3_5_text_model(cfg, source, finalizer,
                                      /*use_inputs_embeds=*/true,
@@ -370,6 +364,8 @@ void export_qwen3_5_for_vlmpipeline(
     const std::filesystem::path& output_dir,
     const Qwen3_5ExportOptions& options) {
 
+    enable_zero_copy_safetensors_if_unset();
+
     auto cfg = Qwen3_5Config::from_json_file(model_dir / "config.json");
 
     auto data = ov::genai::safetensors::load_safetensors(model_dir);
@@ -470,6 +466,8 @@ std::pair<std::string, ov::Tensor> serialize_qwen3_5_model_to_memory(
 ModelsMap build_qwen3_5_models_map(
     const std::filesystem::path& model_dir,
     const Qwen3_5ExportOptions& options) {
+
+    enable_zero_copy_safetensors_if_unset();
 
     auto cfg = Qwen3_5Config::from_json_file(model_dir / "config.json");
 

@@ -56,6 +56,8 @@ public:
      * @return Reference to the tensor
      */
     const ov::Tensor& get_tensor(const std::string& name) const override;
+    void release_tensor(const std::string& name) override;
+    void release_all_cached_tensors() override;
 
 private:
     /**

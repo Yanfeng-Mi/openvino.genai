@@ -1232,8 +1232,8 @@ int main(int argc, char* argv[]) try {
     }
     // Pre-allocate USM-host tensor for decode position_ids - reuse across steps
     // to avoid per-step create_host_tensor() + memcpy overhead.
-    // Shape: [3, batch, 1] (3 planes of identical position values per batch element)
-    ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {3, batch, 1});
+    // Shape: [4, batch, 1]: plane 0 is text position, planes 1-3 are MRoPE positions.
+    ov::Tensor usm_decode_pos = make_usm_host_tensor(gpu_ctx, ov::element::i64, {4, batch, 1});
     const int64_t* rope_deltas_data = plan.rope_deltas.data<const int64_t>();
 
     size_t decode_steps = 0;
@@ -1247,13 +1247,15 @@ int main(int argc, char* argv[]) try {
             step_data[b] = next_id;
         }
 
-        // Fill position_ids in-place: all 3 planes get the same value per batch element
+        // Fill position_ids in-place for Qwen3.5 4-plane MRoPE.
         auto* pos_data = usm_decode_pos.data<int64_t>();
         for (size_t b = 0; b < batch; ++b) {
-            const int64_t value = past_len + rope_deltas_data[b];
-            pos_data[b] = value;             // plane 0
-            pos_data[batch + b] = value;     // plane 1
-            pos_data[2 * batch + b] = value; // plane 2
+            const int64_t text_value = past_len;
+            const int64_t mrope_value = past_len + rope_deltas_data[b];
+            pos_data[b] = text_value;
+            pos_data[batch + b] = mrope_value;
+            pos_data[2 * batch + b] = mrope_value;
+            pos_data[3 * batch + b] = mrope_value;
         }
 
         text_request.set_tensor(ov::genai::modeling::models::Qwen3_5TextIO::kInputIds, step_ids);

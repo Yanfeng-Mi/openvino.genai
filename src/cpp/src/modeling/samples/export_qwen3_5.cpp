@@ -6,15 +6,17 @@
 ///        OpenVINO IR files.
 ///
 /// Usage:
-///   export_qwen3_5 <MODEL_DIR> <OUTPUT_DIR> [TEXT_QUANT] [TEXT_GS] [VISION_QUANT] [VISION_GS]
+///   export_qwen3_5 <MODEL_DIR> <OUTPUT_DIR> [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP] [VISION_QUANT] [VISION_GS] [VISION_BACKUP]
 ///
 /// Arguments:
 ///   MODEL_DIR     Path to HuggingFace model directory (safetensors + config.json)
 ///   OUTPUT_DIR    Path to output directory for VLMPipeline IR files
 ///   TEXT_QUANT    Text model quantization: NONE | INT4 | INT8  (default: NONE)
 ///   TEXT_GS       Text quantization group size  (default: 128)
+///   TEXT_BACKUP   Text backup quantization for sensitive weights (default: NONE)
 ///   VISION_QUANT  Vision model quantization: NONE | INT4 | INT8  (default: NONE)
 ///   VISION_GS     Vision quantization group size  (default: 128)
+///   VISION_BACKUP Vision backup quantization for sensitive weights (default: NONE)
 ///
 /// Output:
 ///   openvino_vision_embeddings_model.xml/bin
@@ -40,14 +42,16 @@ int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0]
                   << " <MODEL_DIR> <OUTPUT_DIR>"
-                  << " [TEXT_QUANT] [TEXT_GS] [VISION_QUANT] [VISION_GS]\n"
+                  << " [TEXT_QUANT] [TEXT_GS] [TEXT_BACKUP] [VISION_QUANT] [VISION_GS] [VISION_BACKUP]\n"
                   << "\n"
                   << "  MODEL_DIR     HuggingFace model directory with safetensors\n"
                   << "  OUTPUT_DIR    Output directory for VLMPipeline-compatible IRs\n"
                   << "  TEXT_QUANT    NONE | INT4 | INT8 (default: NONE)\n"
                   << "  TEXT_GS       Text quantization group size (default: 128)\n"
+                  << "  TEXT_BACKUP   NONE | INT4 | INT8 (default: NONE)\n"
                   << "  VISION_QUANT  NONE | INT4 | INT8 (default: NONE)\n"
-                  << "  VISION_GS     Vision quantization group size (default: 128)\n";
+                  << "  VISION_GS     Vision quantization group size (default: 128)\n"
+                  << "  VISION_BACKUP NONE | INT4 | INT8 (default: NONE)\n";
         return 1;
     }
 
@@ -58,16 +62,20 @@ int main(int argc, char* argv[]) {
 
     if (argc > 3) options.text_quant_mode = argv[3];
     if (argc > 4) options.text_quant_group_size = std::atoi(argv[4]);
-    if (argc > 5) options.vision_quant_mode = argv[5];
-    if (argc > 6) options.vision_quant_group_size = std::atoi(argv[6]);
+    if (argc > 5) options.text_quant_backup_mode = argv[5];
+    if (argc > 6) options.vision_quant_mode = argv[6];
+    if (argc > 7) options.vision_quant_group_size = std::atoi(argv[7]);
+    if (argc > 8) options.vision_quant_backup_mode = argv[8];
 
     std::cout << "=== Qwen3.5-VL VLMPipeline Export (Phase 1: No DeepStack) ===\n"
               << "  Model:   " << model_dir << "\n"
               << "  Output:  " << output_dir << "\n"
               << "  Text Q:  " << options.text_quant_mode
-              << " (gs=" << options.text_quant_group_size << ")\n"
+              << " (gs=" << options.text_quant_group_size
+              << ", backup=" << options.text_quant_backup_mode << ")\n"
               << "  Vision Q: " << options.vision_quant_mode
-              << " (gs=" << options.vision_quant_group_size << ")\n"
+              << " (gs=" << options.vision_quant_group_size
+              << ", backup=" << options.vision_quant_backup_mode << ")\n"
               << std::endl;
 
     const auto start = std::chrono::steady_clock::now();

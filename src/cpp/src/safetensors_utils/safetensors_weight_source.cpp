@@ -101,6 +101,15 @@ const ov::Tensor& SafetensorsWeightSource::get_tensor(const std::string& name) c
     return m_tensor_cache[name];
 }
 
+void SafetensorsWeightSource::release_tensor(const std::string& name) {
+    m_tensor_cache.erase(name);
+    m_tensor_cache.erase(get_hf_name(name));
+}
+
+void SafetensorsWeightSource::release_all_cached_tensors() {
+    m_tensor_cache.clear();
+}
+
 const TensorInfo& SafetensorsWeightSource::get_info(const std::string& name) const {
     std::string hf_name = get_hf_name(name);
     

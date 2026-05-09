@@ -90,6 +90,9 @@ StatefulLLMPipeline::StatefulLLMPipeline(
             auto pshape = input.get_partial_shape();
             if (pshape.rank().is_static() && pshape.rank().get_length() == 3) {
                 m_has_3d_position_ids = true;
+                if (pshape[0].is_static()) {
+                    m_position_ids_dim_size = static_cast<size_t>(pshape[0].get_length());
+                }
             }
             break;
         }
@@ -427,18 +430,18 @@ EncodedResults StatefulLLMPipeline::generate(
     if (position_ids_available) {
         const size_t seq_len = input_ids.get_shape().at(1);
         if (m_has_3d_position_ids) {
-            // MRoPE (3D position_ids) for models like Qwen3.5
-            // Shape: {3, batch, seq_len}, all 3 dims have same values for text-only
-            position_ids = ov::Tensor{ov::element::i64, {3, batch_size, seq_len}};
+            // MRoPE position_ids. Some models use three planes (T/H/W), while Qwen3.5 uses
+            // four planes where plane 0 is the text position and planes 1-3 are T/H/W.
+            position_ids = ov::Tensor{ov::element::i64, {m_position_ids_dim_size, batch_size, seq_len}};
             auto* pos_data = position_ids->data<int64_t>();
             const size_t plane_stride = batch_size * seq_len;
             for (size_t b = 0; b < batch_size; ++b) {
                 for (size_t s = 0; s < seq_len; ++s) {
                     const int64_t pos = static_cast<int64_t>(kv_cache_len + s);
                     const size_t idx = b * seq_len + s;
-                    pos_data[idx] = pos;                      // t dimension
-                    pos_data[plane_stride + idx] = pos;       // h dimension  
-                    pos_data[2 * plane_stride + idx] = pos;   // w dimension
+                    for (size_t dim = 0; dim < m_position_ids_dim_size; ++dim) {
+                        pos_data[dim * plane_stride + idx] = pos;
+                    }
                 }
             }
             rope_delta = 0;  // For text-only input, no visual content shift

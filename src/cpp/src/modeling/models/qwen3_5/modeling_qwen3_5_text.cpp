@@ -728,16 +728,20 @@ std::pair<Tensor, Tensor> Qwen3_5Model::build_mrope_cos_sin(const Tensor& positi
     auto inv_freq_reshaped =
         inv_freq_tensor.reshape({1, 1, static_cast<int64_t>(half_dim)}, false);
 
-    const auto pos_rank = position_ids.output().get_partial_shape().rank();
+    const auto position_shape = position_ids.output().get_partial_shape();
+    const auto pos_rank = position_shape.rank();
     if (pos_rank.is_static() && pos_rank.get_length() == 2) {
         auto pos_f = position_ids.to(ov::element::f32);
         auto freqs = pos_f.unsqueeze(2) * inv_freq_reshaped;
         return {freqs.cos(), freqs.sin()};
     }
 
-    auto pos_t = ops::slice(position_ids, 0, 1, 1, 0).squeeze(0).to(ov::element::f32);
-    auto pos_h = ops::slice(position_ids, 1, 2, 1, 0).squeeze(0).to(ov::element::f32);
-    auto pos_w = ops::slice(position_ids, 2, 3, 1, 0).squeeze(0).to(ov::element::f32);
+    const bool has_text_plane = pos_rank.is_static() && pos_rank.get_length() == 3 &&
+                                position_shape[0].is_static() && position_shape[0].get_length() == 4;
+    const int64_t axis_offset = has_text_plane ? 1 : 0;
+    auto pos_t = ops::slice(position_ids, axis_offset, axis_offset + 1, 1, 0).squeeze(0).to(ov::element::f32);
+    auto pos_h = ops::slice(position_ids, axis_offset + 1, axis_offset + 2, 1, 0).squeeze(0).to(ov::element::f32);
+    auto pos_w = ops::slice(position_ids, axis_offset + 2, axis_offset + 3, 1, 0).squeeze(0).to(ov::element::f32);
 
     auto freqs_t = pos_t.unsqueeze(2) * inv_freq_reshaped;
     if (!cfg_.mrope_interleaved) {
@@ -775,7 +779,10 @@ Tensor Qwen3_5Model::forward_impl(const Tensor* input_ids,
     const auto position_ps = position_ids.output().get_partial_shape();
     const auto position_rank = position_ps.rank();
     OPENVINO_ASSERT(!position_rank.is_static() || position_rank.get_length() == 3,
-                    "position_ids must have rank 3 [3, B, S]");
+                    "position_ids must have rank 3 [4, B, S]");
+    if (position_rank.is_static() && position_rank.get_length() == 3 && position_ps[0].is_static()) {
+        OPENVINO_ASSERT(position_ps[0].get_length() == 4, "position_ids first dimension must be 4 [4, B, S]");
+    }
 
     if (source_rank.is_static() && source_rank.get_length() >= 2 && position_rank.is_static() &&
         position_rank.get_length() == 3 && source_ps[0].is_static() && source_ps[1].is_static() &&
@@ -1009,7 +1016,7 @@ std::shared_ptr<ov::Model> create_qwen3_5_text_model(
 
     const auto float_type = ov::element::f32;
     auto attention_mask = ctx.parameter(Qwen3_5TextIO::kAttentionMask, ov::element::i64, ov::PartialShape{-1, -1});
-    auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{3, -1, -1});
+    auto position_ids = ctx.parameter(Qwen3_5TextIO::kPositionIds, ov::element::i64, ov::PartialShape{4, -1, -1});
     auto beam_idx = ctx.parameter(Qwen3_5TextIO::kBeamIdx, ov::element::i32, ov::PartialShape{-1});
 
     Tensor input_ids;

@@ -1032,7 +1032,7 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
     const size_t batch = shape[0];
     const size_t seq_len = shape[1];
 
-    ov::Tensor position_ids(ov::element::i64, {3, batch, seq_len});
+    ov::Tensor position_ids(ov::element::i64, {4, batch, seq_len});
     std::memset(position_ids.data(), 0, position_ids.get_byte_size());
 
     ov::Tensor rope_deltas(ov::element::i64, {batch, 1});
@@ -1089,9 +1089,11 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
         std::vector<int64_t> pos_t;
         std::vector<int64_t> pos_h;
         std::vector<int64_t> pos_w;
+        std::vector<int64_t> pos_text;
         pos_t.reserve(tokens.size());
         pos_h.reserve(tokens.size());
         pos_w.reserve(tokens.size());
+        pos_text.reserve(tokens.size());
 
         int64_t last_max = -1;
         size_t st = 0;
@@ -1108,6 +1110,7 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
                 pos_t.push_back(value);
                 pos_h.push_back(value);
                 pos_w.push_back(value);
+                pos_text.push_back(static_cast<int64_t>(pos_text.size()));
             }
             last_max = base + static_cast<int64_t>(length) - 1;
         };
@@ -1130,6 +1133,7 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
                         pos_t.push_back(base + tt);
                         pos_h.push_back(base + hh);
                         pos_w.push_back(base + ww);
+                        pos_text.push_back(static_cast<int64_t>(pos_text.size()));
                         max_dim = std::max(max_dim, std::max(tt, std::max(hh, ww)));
                     }
                 }
@@ -1205,7 +1209,7 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
             append_text(tokens.size() - st);
         }
 
-        if (pos_t.size() != tokens.size()) {
+        if (pos_t.size() != tokens.size() || pos_text.size() != tokens.size()) {
             OPENVINO_THROW("Position ids length mismatch");
         }
 
@@ -1219,9 +1223,10 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
         for (size_t i = 0; i < tokens.size(); ++i) {
             const size_t s = active_indices[i];
             const size_t base = b * seq_len + s;
-            pos_data[0 * batch * seq_len + base] = pos_t[i];
-            pos_data[1 * batch * seq_len + base] = pos_h[i];
-            pos_data[2 * batch * seq_len + base] = pos_w[i];
+            pos_data[0 * batch * seq_len + base] = pos_text[i];
+            pos_data[1 * batch * seq_len + base] = pos_t[i];
+            pos_data[2 * batch * seq_len + base] = pos_h[i];
+            pos_data[3 * batch * seq_len + base] = pos_w[i];
         }
 
         if (attention_mask) {
@@ -1233,6 +1238,7 @@ Qwen3_5InputPlan Qwen3_5InputPlanner::build_plan(const ov::Tensor& input_ids,
                 pos_data[0 * batch * seq_len + idx] = 0;
                 pos_data[1 * batch * seq_len + idx] = 0;
                 pos_data[2 * batch * seq_len + idx] = 0;
+                pos_data[3 * batch * seq_len + idx] = 0;
             }
         }
 
@@ -1319,7 +1325,7 @@ ov::Tensor Qwen3_5InputPlanner::build_decode_position_ids(const ov::Tensor& rope
         OPENVINO_THROW("rope_deltas must have shape [B] or [B, 1]");
     }
 
-    ov::Tensor position_ids(ov::element::i64, {3, batch, static_cast<size_t>(seq_len)});
+    ov::Tensor position_ids(ov::element::i64, {4, batch, static_cast<size_t>(seq_len)});
     auto* out = position_ids.data<int64_t>();
     const int64_t* deltas = rope_deltas.data<const int64_t>();
     const size_t plane_stride = batch * static_cast<size_t>(seq_len);
@@ -1329,9 +1335,10 @@ ov::Tensor Qwen3_5InputPlanner::build_decode_position_ids(const ov::Tensor& rope
         for (int64_t s = 0; s < seq_len; ++s) {
             const int64_t value = base + s;
             const size_t idx = b * static_cast<size_t>(seq_len) + static_cast<size_t>(s);
-            out[idx] = value;
+            out[idx] = past_length + s;
             out[plane_stride + idx] = value;
             out[2 * plane_stride + idx] = value;
+            out[3 * plane_stride + idx] = value;
         }
     }
 

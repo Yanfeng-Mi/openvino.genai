@@ -158,7 +158,7 @@ TEST(Qwen3_5Config, RejectsImplicitHeadDimWhenHiddenSizeNotDivisibleByHeads) {
     }
 }
 
-TEST(Qwen3_5RopePlanner, BuildPlanProducesThreeChannelPositionIds) {
+TEST(Qwen3_5RopePlanner, BuildPlanProducesFourChannelPositionIds) {
     const auto cfg = make_small_cfg();
     ov::genai::modeling::models::Qwen3_5InputPlanner planner(cfg);
 
@@ -183,7 +183,7 @@ TEST(Qwen3_5RopePlanner, BuildPlanProducesThreeChannelPositionIds) {
     auto plan = planner.build_plan(input_ids, &attention_mask, &grid_thw);
     const auto pos_shape = plan.position_ids.get_shape();
     ASSERT_EQ(pos_shape.size(), 3u);
-    EXPECT_EQ(pos_shape[0], 3u);
+    EXPECT_EQ(pos_shape[0], 4u);
     EXPECT_EQ(pos_shape[1], 1u);
     EXPECT_EQ(pos_shape[2], 3u);
 
@@ -242,6 +242,7 @@ TEST(Qwen3_5RopePlanner, BuildPlanHandlesImageAndVideoPlaceholders) {
         EXPECT_EQ(pos[i], i);
         EXPECT_EQ(pos[7 + i], i);
         EXPECT_EQ(pos[14 + i], i);
+        EXPECT_EQ(pos[21 + i], i);
     }
 
     EXPECT_EQ(plan.rope_deltas.data<const int64_t>()[0], 0);
@@ -293,17 +294,19 @@ TEST(Qwen3_5RopePlanner, DecodePositionIdsApplyRopeDeltas) {
         ov::genai::modeling::models::Qwen3_5InputPlanner::build_decode_position_ids(rope_deltas, 10, 2);
     const auto shape = position_ids.get_shape();
     ASSERT_EQ(shape.size(), 3u);
-    EXPECT_EQ(shape[0], 3u);
+    EXPECT_EQ(shape[0], 4u);
     EXPECT_EQ(shape[1], 1u);
     EXPECT_EQ(shape[2], 2u);
 
     const auto* data = position_ids.data<const int64_t>();
-    EXPECT_EQ(data[0], 13);
-    EXPECT_EQ(data[1], 14);
+    EXPECT_EQ(data[0], 10);
+    EXPECT_EQ(data[1], 11);
     EXPECT_EQ(data[2], 13);
     EXPECT_EQ(data[3], 14);
     EXPECT_EQ(data[4], 13);
     EXPECT_EQ(data[5], 14);
+    EXPECT_EQ(data[6], 13);
+    EXPECT_EQ(data[7], 14);
 }
 
 TEST(Qwen3_5RopePlanner, BuildPlanUsesActiveTokensForRopeDeltaAndZeroPadsMaskedPositions) {
@@ -401,26 +404,35 @@ TEST(Qwen3_5RopePlanner, BuildPlanKeepsTextOffsetAroundVisionSpan) {
     const int64_t* pos = plan.position_ids.data<const int64_t>();
     constexpr size_t seq_len = 7;
 
-    // Plane 0 (temporal)
+    // Plane 0 (text)
     EXPECT_EQ(pos[0 * seq_len + 0], 0);
     EXPECT_EQ(pos[0 * seq_len + 1], 1);
     EXPECT_EQ(pos[0 * seq_len + 2], 2);
-    EXPECT_EQ(pos[0 * seq_len + 3], 2);
-    EXPECT_EQ(pos[0 * seq_len + 4], 2);
-    EXPECT_EQ(pos[0 * seq_len + 5], 2);
-    EXPECT_EQ(pos[0 * seq_len + 6], 4);
+    EXPECT_EQ(pos[0 * seq_len + 3], 3);
+    EXPECT_EQ(pos[0 * seq_len + 4], 4);
+    EXPECT_EQ(pos[0 * seq_len + 5], 5);
+    EXPECT_EQ(pos[0 * seq_len + 6], 6);
 
-    // Plane 1 (height)
+    // Plane 1 (temporal)
+    EXPECT_EQ(pos[1 * seq_len + 0], 0);
+    EXPECT_EQ(pos[1 * seq_len + 1], 1);
     EXPECT_EQ(pos[1 * seq_len + 2], 2);
     EXPECT_EQ(pos[1 * seq_len + 3], 2);
-    EXPECT_EQ(pos[1 * seq_len + 4], 3);
-    EXPECT_EQ(pos[1 * seq_len + 5], 3);
+    EXPECT_EQ(pos[1 * seq_len + 4], 2);
+    EXPECT_EQ(pos[1 * seq_len + 5], 2);
+    EXPECT_EQ(pos[1 * seq_len + 6], 4);
 
-    // Plane 2 (width)
+    // Plane 2 (height)
     EXPECT_EQ(pos[2 * seq_len + 2], 2);
-    EXPECT_EQ(pos[2 * seq_len + 3], 3);
-    EXPECT_EQ(pos[2 * seq_len + 4], 2);
+    EXPECT_EQ(pos[2 * seq_len + 3], 2);
+    EXPECT_EQ(pos[2 * seq_len + 4], 3);
     EXPECT_EQ(pos[2 * seq_len + 5], 3);
+
+    // Plane 3 (width)
+    EXPECT_EQ(pos[3 * seq_len + 2], 2);
+    EXPECT_EQ(pos[3 * seq_len + 3], 3);
+    EXPECT_EQ(pos[3 * seq_len + 4], 2);
+    EXPECT_EQ(pos[3 * seq_len + 5], 3);
 
     const int64_t* rope_delta = plan.rope_deltas.data<const int64_t>();
     EXPECT_EQ(rope_delta[0], 0);

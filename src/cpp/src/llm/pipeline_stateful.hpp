@@ -29,8 +29,9 @@ class StatefulLLMPipeline final : public LLMPipelineImplBase {
     bool m_is_npu = false;
     // include reflection of tokens contained in the kv cache and amount of tokens, which are needed to trim from kv cache on the next step of chat
     utils::KVCacheState m_kv_cache_state;
-    // True if model uses 3D position_ids (MRoPE - multi-resolution RoPE) like Qwen3.5
+    // True if model uses 3D position_ids (MRoPE - multi-resolution RoPE).
     bool m_has_3d_position_ids = false;
+    size_t m_position_ids_dim_size = 3;
 
     void reset_kv_state();
 public:

@@ -3,6 +3,8 @@
 
 #include "visual_language/qwen3_vl/classes.hpp"
 
+#include <tuple>
+
 #include <openvino/core/type/bfloat16.hpp>
 #include <openvino/core/type/float16.hpp>
 
@@ -561,13 +563,15 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     int64_t image_pad_token_id = m_vision_token_ids.at("image_pad");
     int64_t video_pad_token_id = m_vision_token_ids.at("video_pad");
 
-    m_position_ids = create_position_ids(input_ids, images_grid_thw, images_sequence, 0, 
-                                         videos_grid_thw, videos_sequence, 0, 
-                                         vision_start_token_id, history_vision_count);
-
-    int64_t position_ids_max = *std::max_element(m_position_ids.data<int64_t>(), 
-                                                 m_position_ids.data<int64_t>() + m_position_ids.get_size());
-    m_rope_delta = position_ids_max + 1 - static_cast<int64_t>(input_ids.get_shape().at(1));
+    std::tie(m_position_ids, m_rope_delta) = create_position_ids(input_ids,
+                                                                 images_grid_thw,
+                                                                 images_sequence,
+                                                                 0,
+                                                                 videos_grid_thw,
+                                                                 videos_sequence,
+                                                                 0,
+                                                                 vision_start_token_id,
+                                                                 history_vision_count);
 
     if (images.empty() && videos.empty()) {
         // visual_pos_masks extra input
