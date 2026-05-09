@@ -286,10 +286,10 @@ Tensor Qwen3_5VisionBlock::forward(const Tensor& hidden_states,
                                    const Tensor& rotary_cos,
                                    const Tensor& rotary_sin,
                                    const Tensor* cu_seq_lens) const {
-    auto norm1 = ops::nn::layer_norm(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
+    auto norm1 = ops::nn::layer_norm_mvn(hidden_states, norm1_weight(), &norm1_bias(), eps_, -1);
     auto attn_out = attn_.forward(norm1, rotary_cos, rotary_sin, cu_seq_lens);
     auto resid1 = hidden_states + attn_out;
-    auto norm2 = ops::nn::layer_norm(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
+    auto norm2 = ops::nn::layer_norm_mvn(resid1, norm2_weight(), &norm2_bias(), eps_, -1);
     auto mlp_out = mlp_.forward(norm2);
     return resid1 + mlp_out;
 }
@@ -351,9 +351,9 @@ Tensor Qwen3_5VisionPatchMerger::forward(const Tensor& hidden_states) const {
     Tensor x;
     if (use_postshuffle_norm_) {
         auto reshaped = hidden_states.reshape({-1, merged_hidden_size_});
-        x = ops::nn::layer_norm(reshaped, norm_weight(), &norm_bias(), eps_, -1);
+        x = ops::nn::layer_norm_mvn(reshaped, norm_weight(), &norm_bias(), eps_, -1);
     } else {
-        auto normed = ops::nn::layer_norm(hidden_states, norm_weight(), &norm_bias(), eps_, -1);
+        auto normed = ops::nn::layer_norm_mvn(hidden_states, norm_weight(), &norm_bias(), eps_, -1);
         x = normed.reshape({-1, merged_hidden_size_});
     }
     auto fc1 = add_bias_if_present(ops::linear(x, fc1_weight()), fc1_bias());

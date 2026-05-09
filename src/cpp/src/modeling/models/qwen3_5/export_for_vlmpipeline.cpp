@@ -144,16 +144,16 @@ std::shared_ptr<ov::Model> create_qwen3_5_vision_merger_model(
                                          ov::element::f32,
                                          ov::PartialShape{-1, head_dim});
 
-    auto attention_mask = ctx.parameter("attention_mask",
-                                         ov::element::f32,
-                                         ov::PartialShape{1, -1, -1});
+    auto cu_seq_lens = ctx.parameter("cu_seq_lens",
+                                      ov::element::i32,
+                                      ov::PartialShape{-1});
 
     // Compute cos/sin from rotary_pos_emb
     auto rotary_cos = rotary_pos_emb.cos();
     auto rotary_sin = rotary_pos_emb.sin();
 
     // Run blocks + merger + deepstack via forward_blocks (no PatchEmbed)
-    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin);
+    auto output = model.forward_blocks(hidden_states, rotary_cos, rotary_sin, &cu_seq_lens);
 
     ov::OutputVector results;
 

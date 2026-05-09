@@ -7,10 +7,12 @@
 #include <gtest/gtest.h>
 
 #include <openvino/openvino.hpp>
+#include <openvino/op/mvn.hpp>
 #include <openvino/op/transpose.hpp>
 #include <ov_ops/vl_sdpa.hpp>
 
 #include "modeling/builder_context.hpp"
+#include "modeling/models/qwen3_5/export_for_vlmpipeline.hpp"
 #include "modeling/models/qwen3_5/modeling_qwen3_5_vision.hpp"
 #include "modeling/models/qwen3_5/qwen3_5_weight_specs.hpp"
 #include "modeling/tests/test_utils.hpp"
@@ -120,11 +122,80 @@ TEST(Qwen3_5VisionModelTest, FullModelDerivesCuSeqLensAndBuildsVlsdpa) {
     auto model = ov::genai::modeling::models::create_qwen3_5_vision_model(cfg, source, finalizer);
 
     size_t vlsdpa_count = 0;
+    size_t mvn_count = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::internal::VLSDPA>(node)) {
+            ++vlsdpa_count;
+        }
+        if (ov::as_type_ptr<ov::op::v6::MVN>(node)) {
+            ++mvn_count;
+        }
+    }
+
+    EXPECT_EQ(vlsdpa_count, static_cast<size_t>(cfg.vision.depth));
+    EXPECT_EQ(mvn_count, static_cast<size_t>(cfg.vision.depth * 2 + 1));
+}
+
+TEST(Qwen3_5VisionPatchMergerTest, ExplicitLayerNormBuildsMvn) {
+    ov::genai::modeling::BuilderContext ctx;
+
+    ov::genai::modeling::models::Qwen3_5VisionConfig cfg;
+    cfg.hidden_size = 4;
+    cfg.intermediate_size = 8;
+    cfg.out_hidden_size = 4;
+    cfg.spatial_merge_size = 2;
+
+    ov::genai::modeling::models::Qwen3_5VisionPatchMerger merger(ctx, "merger", cfg, false);
+
+    test_utils::DummyWeightSource weights;
+    weights.add("merger.norm.weight", test_utils::make_tensor(std::vector<float>(4, 1.0f), {4}));
+    weights.add("merger.norm.bias", test_utils::make_tensor(std::vector<float>(4, 0.0f), {4}));
+    weights.add("merger.linear_fc1.weight", test_utils::make_tensor(std::vector<float>(8 * 16, 0.0f), {8, 16}));
+    weights.add("merger.linear_fc1.bias", test_utils::make_tensor(std::vector<float>(8, 0.0f), {8}));
+    weights.add("merger.linear_fc2.weight", test_utils::make_tensor(std::vector<float>(4 * 8, 0.0f), {4, 8}));
+    weights.add("merger.linear_fc2.bias", test_utils::make_tensor(std::vector<float>(4, 0.0f), {4}));
+
+    test_utils::DummyWeightFinalizer finalizer;
+    ov::genai::modeling::weights::load_model(merger, weights, finalizer);
+
+    auto hidden_states = ctx.parameter("hidden_states", ov::element::f32, ov::PartialShape{4, 4});
+
+    auto output = merger.forward(hidden_states);
+    auto model = ctx.build_model({output.output()});
+
+    size_t mvn_count = 0;
+    for (const auto& node : model->get_ordered_ops()) {
+        if (ov::as_type_ptr<ov::op::v6::MVN>(node)) {
+            ++mvn_count;
+        }
+    }
+
+    EXPECT_EQ(mvn_count, 1u);
+}
+
+TEST(Qwen3_5VisionModelTest, MergerExportUsesCuSeqLensAndBuildsVlsdpa) {
+    const auto cfg = make_small_cfg();
+    auto specs = ov::genai::modeling::models::build_qwen3_5_vlm_weight_specs(cfg);
+    ov::genai::modeling::weights::SyntheticWeightSource source(std::move(specs), 2029u, -0.02f, 0.02f);
+    test_utils::DummyWeightFinalizer finalizer;
+
+    auto model = ov::genai::modeling::models::create_qwen3_5_vision_merger_model(cfg, source, finalizer);
+
+    bool has_cu_seq_lens = false;
+    bool has_attention_mask = false;
+    size_t vlsdpa_count = 0;
+    for (const auto& input : model->inputs()) {
+        const auto& names = input.get_names();
+        has_cu_seq_lens |= names.count("cu_seq_lens") != 0;
+        has_attention_mask |= names.count("attention_mask") != 0;
+    }
     for (const auto& node : model->get_ordered_ops()) {
         if (ov::as_type_ptr<ov::op::internal::VLSDPA>(node)) {
             ++vlsdpa_count;
         }
     }
 
+    EXPECT_TRUE(has_cu_seq_lens);
+    EXPECT_FALSE(has_attention_mask);
     EXPECT_EQ(vlsdpa_count, static_cast<size_t>(cfg.vision.depth));
 }
