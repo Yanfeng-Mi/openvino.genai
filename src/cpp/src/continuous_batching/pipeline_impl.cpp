@@ -26,13 +26,13 @@ namespace {
 
 // Returns available RAM memory on system if possible, otherwise returns std::numeric_limits<std::streamsize>::max()
 size_t get_available_cpu_memory() {
-#ifdef __APPLE__ 
+#ifdef __APPLE__
     int64_t memsize;
     size_t len = sizeof(memsize);
     if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0) {
         return memsize;
     }
-#endif 
+#endif
 
 #if !defined(_WIN32)
     std::string token;
@@ -170,6 +170,7 @@ void ContinuousBatchingPipeline::ContinuousBatchingImpl::initialize_pipeline(
                     "Continuous batching: execution device is expected to be single CPU / single GPU / multi GPUs");
     const std::string execution_device = execution_devices[0];
 
+    ov::genai::utils::dump_runtime_model_if_requested(compiled_model, "cb_language_model_compiled");
     ov::genai::utils::print_compiled_model_properties(compiled_model, "LLM with Paged Attention");
     ov::InferRequest infer_request = compiled_model.create_infer_request();
 
@@ -294,12 +295,12 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::add_request(
     std::shared_ptr<SequenceGroup> sequence_group;
     if (m_model_input_type == ModelInputType::EMBEDDINGS) {
         const auto [position_ids, rope_delta] = m_inputs_embedder->get_position_ids(input_ids.get_shape()[1], 0);
-        sequence_group = std::make_shared<SequenceGroup>(request_id, 
-                                                         input_ids, 
-                                                         sampling_params_copy, 
+        sequence_group = std::make_shared<SequenceGroup>(request_id,
+                                                         input_ids,
+                                                         sampling_params_copy,
                                                          token_type_ids,
                                                          lm_extra_inputs,
-                                                         position_ids, 
+                                                         position_ids,
                                                          rope_delta,
                                                          prompt_ids);
     }
@@ -565,7 +566,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::generate(const std::vector<o
         try {
             const auto infer_start = std::chrono::steady_clock::now();
             step();
-            
+
             // During prefill step (or steps if max_batch_size < prompt_len) we don't generate new tokens,
             // but still inference took place, so we need to add this time to the total inference duration.
             raw_perf_counters.m_inference_durations[0] += MicroSeconds(m_pipeline_metrics.inference_duration);
@@ -641,7 +642,7 @@ ContinuousBatchingPipeline::ContinuousBatchingImpl::generate(const std::vector<o
     OPENVINO_ASSERT(results.size() == input_ids.size());
 
     generate_timer.end();
-    
+
     const auto& scheduler_config = m_scheduler->get_config();
     // Clear cache in case of dynamic cache allocation and no prefix caching
     if (!scheduler_config.enable_prefix_caching && scheduler_config.cache_size == 0 && scheduler_config.num_kv_blocks == 0) {

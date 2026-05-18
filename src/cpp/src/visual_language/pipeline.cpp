@@ -170,6 +170,7 @@ private:
             utils::apply_slice_before_matmul_transformation(language_model);
             compiled_language_model = utils::singleton_core().compile_model(language_model, device, lm_properties);
         }
+        ov::genai::utils::dump_runtime_model_if_requested(compiled_language_model, "vlm_language_model_compiled");
         ov::genai::utils::print_compiled_model_properties(compiled_language_model, "VLM language model");
 
         m_language = compiled_language_model.create_infer_request();
@@ -217,8 +218,9 @@ private:
         // After this transformation, default path returns logits with seq_len == 1,
         // i.e. [N, 1, vocab_size], not [N, conversation length, vocab_size].
         utils::apply_slice_before_matmul_transformation(language_model);
-        m_language = utils::singleton_core().compile_model(language_model, device, properties_copy
-        ).create_infer_request();
+    auto compiled_language_model = utils::singleton_core().compile_model(language_model, device, properties_copy);
+        ov::genai::utils::dump_runtime_model_if_requested(compiled_language_model, "vlm_language_model_compiled");
+        m_language = compiled_language_model.create_infer_request();
         m_language.get_tensor("attention_mask").set_shape({1, 0});
         finalize_initialization(language_model, kv_pos);
     }
@@ -331,9 +333,18 @@ public:
         m_inputs_embedder->set_vision_token_pruning_config(generation_config.pruning_ratio,
                                                            generation_config.relevance_weight);
 
+        const auto vision_encode_start = std::chrono::steady_clock::now();
         auto encoded_images = m_inputs_embedder->encode_images(images);
         auto encoded_videos = m_inputs_embedder->encode_videos(videos, videos_metadata);
+        const auto vision_encode_end = std::chrono::steady_clock::now();
+        perf_metrics.vlm_raw_metrics.vision_encode_durations.emplace_back(
+            PerfMetrics::get_microsec(vision_encode_end - vision_encode_start));
+
+        const auto prompt_normalize_start = std::chrono::steady_clock::now();
         auto [unified_prompt, image_sequence, video_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, m_video_id, encoded_images, encoded_videos);
+        const auto prompt_normalize_end = std::chrono::steady_clock::now();
+        perf_metrics.vlm_raw_metrics.prompt_normalize_durations.emplace_back(
+            PerfMetrics::get_microsec(prompt_normalize_end - prompt_normalize_start));
 
         if (m_is_chat_conversation) {
             m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
@@ -459,6 +470,20 @@ public:
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.begin(),
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.end()
         );
+        decoded.perf_metrics.vlm_raw_metrics.vision_encode_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.vision_encode_durations.end(),
+            perf_metrics.vlm_raw_metrics.vision_encode_durations.begin(),
+            perf_metrics.vlm_raw_metrics.vision_encode_durations.end()
+        );
+        decoded.perf_metrics.vlm_raw_metrics.prompt_normalize_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.prompt_normalize_durations.end(),
+            perf_metrics.vlm_raw_metrics.prompt_normalize_durations.begin(),
+            perf_metrics.vlm_raw_metrics.prompt_normalize_durations.end()
+        );
+        if (!encoded_result.perf_metrics.raw_metrics.m_token_infer_durations.empty()) {
+            decoded.perf_metrics.vlm_raw_metrics.prefill_inference_durations.emplace_back(
+                encoded_result.perf_metrics.raw_metrics.m_token_infer_durations.front());
+        }
 
         // Evaluate statistics
         decoded.perf_metrics.m_evaluated = false;
@@ -562,7 +587,7 @@ public:
         );
 
         EncodedResults& encoded_result = generation_finish_info.results;
-        
+
         // Update pruned content after generation (CDPruner has run during prepare_inputs_and_generate)
         if (generation_config.pruning_ratio > 0) {
             chat_context.apply_pruning_to_last_message();
@@ -603,6 +628,20 @@ public:
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.begin(),
             perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.end()
         );
+        decoded.perf_metrics.vlm_raw_metrics.vision_encode_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.vision_encode_durations.end(),
+            perf_metrics.vlm_raw_metrics.vision_encode_durations.begin(),
+            perf_metrics.vlm_raw_metrics.vision_encode_durations.end()
+        );
+        decoded.perf_metrics.vlm_raw_metrics.prompt_normalize_durations.insert(
+            decoded.perf_metrics.vlm_raw_metrics.prompt_normalize_durations.end(),
+            perf_metrics.vlm_raw_metrics.prompt_normalize_durations.begin(),
+            perf_metrics.vlm_raw_metrics.prompt_normalize_durations.end()
+        );
+        if (!encoded_result.perf_metrics.raw_metrics.m_token_infer_durations.empty()) {
+            decoded.perf_metrics.vlm_raw_metrics.prefill_inference_durations.emplace_back(
+                encoded_result.perf_metrics.raw_metrics.m_token_infer_durations.front());
+        }
 
         // Evaluate statistics
         decoded.perf_metrics.m_evaluated = false;
@@ -735,7 +774,7 @@ private:
         } else {
             inputs_embeds = m_inputs_embedder->get_inputs_embeds(
                 unified_prompt,
-                encoded_images, 
+                encoded_images,
                 encoded_videos,
                 perf_metrics,
                 recalculate_merged_embeddings,
@@ -813,6 +852,10 @@ private:
         if (m_sampler.get_seed() != generation_config.rng_seed) {
             m_sampler.set_seed(generation_config.rng_seed);
         }
+
+        // Fallback dump point for stateful VLM language graphs. In some runs the
+        // constructor-time dump is not emitted even though dump mode is enabled.
+        ov::genai::utils::dump_runtime_model_if_requested(m_language.get_compiled_model(), "vlm_language_model_compiled");
 
         return ov::genai::get_lm_encoded_results(m_language,
                                                  inputs_embeds,

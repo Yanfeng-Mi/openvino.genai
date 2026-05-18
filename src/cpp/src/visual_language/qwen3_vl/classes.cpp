@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "visual_language/qwen3_vl/classes.hpp"
+
+#include <openvino/core/type/bfloat16.hpp>
+#include <openvino/core/type/float16.hpp>
+
 #include "utils.hpp"
 #include "logger.hpp"
 
@@ -23,6 +27,34 @@ namespace ov::genai {
 namespace {
 
 constexpr float DEFAULT_METADATA_FPS = 24.0f;
+
+ov::Tensor to_f32_tensor(const ov::Tensor& src) {
+    if (src.get_element_type() == ov::element::f32) {
+        return src;
+    }
+
+    ov::Tensor dst{ov::element::f32, src.get_shape()};
+    float* dst_data = dst.data<float>();
+    const size_t total = src.get_size();
+
+    if (src.get_element_type() == ov::element::f16) {
+        const auto* src_data = src.data<const ov::float16>();
+        for (size_t i = 0; i < total; ++i) {
+            dst_data[i] = static_cast<float>(src_data[i]);
+        }
+        return dst;
+    }
+
+    if (src.get_element_type() == ov::element::bf16) {
+        const auto* src_data = src.data<const ov::bfloat16>();
+        for (size_t i = 0; i < total; ++i) {
+            dst_data[i] = static_cast<float>(src_data[i]);
+        }
+        return dst;
+    }
+
+    OPENVINO_THROW("Unsupported position embedding tensor element type: ", src.get_element_type());
+}
 
 /**
  * @brief Calculates timestamps for video frames based on encoded video metadata.
@@ -68,7 +100,7 @@ void fill_video_metadata(VideoMetadata& video_metadata, size_t total_num_frames,
 
     OPENVINO_ASSERT(!(video_config.fps != 0.0f && video_config.num_frames != 0),
         "num_frames and fps are mutually exclusive video config arguments.");
-    
+
     if (!video_config.do_sample_frames) {
         // frames_indices is still needed for timestamp calculation
         video_metadata.frames_indices.resize(total_num_frames);
@@ -78,7 +110,7 @@ void fill_video_metadata(VideoMetadata& video_metadata, size_t total_num_frames,
 
     // Sample frame indices if needed
     size_t num_frames = video_config.num_frames;
-    
+
     if (num_frames == 0 && video_config.fps != 0.0f) {
         if (video_metadata.fps == 0.0f) {
             GENAI_WARN("Requested to sample frames by fps, but video metadata fps is not set. "
@@ -341,7 +373,8 @@ InputsEmbedderQwen3VL::InputsEmbedderQwen3VL(
         pos_model = patch_weighted_sum_into_pos_model(pos_model);
     }
     auto pos_compiled = utils::singleton_core().compile_model(pos_model, device, device_config);
-    
+    ov::genai::utils::dump_runtime_model_if_requested(pos_compiled, "vlm_vision_embeddings_pos_model_compiled");
+
     m_ireq_queue_vision_embeddings_pos = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         pos_compiled.get_property(ov::optimal_number_of_infer_requests),
         [&pos_compiled]() -> ov::InferRequest {
@@ -359,14 +392,15 @@ InputsEmbedderQwen3VL::InputsEmbedderQwen3VL(
     const ov::AnyMap device_config
 ) : InputsEmbedderQwen2VL(vlm_config, models_map, tokenizer, config_dir_path, device, device_config),
     m_use_patched_pos_model(!is_cpp_pos_embeds_fallback_requested()) {
-    const auto& [pos_model_str, pos_weights] = 
+    const auto& [pos_model_str, pos_weights] =
         utils::get_model_weights_pair(models_map, "vision_embeddings_pos");
     auto pos_model = utils::singleton_core().read_model(pos_model_str, pos_weights);
     if (m_use_patched_pos_model) {
         pos_model = patch_weighted_sum_into_pos_model(pos_model);
     }
     auto pos_compiled = utils::singleton_core().compile_model(pos_model, device, device_config);
-    
+    ov::genai::utils::dump_runtime_model_if_requested(pos_compiled, "vlm_vision_embeddings_pos_model_compiled");
+
     m_ireq_queue_vision_embeddings_pos = std::make_unique<CircularBufferQueue<ov::InferRequest>>(
         pos_compiled.get_property(ov::optimal_number_of_infer_requests),
         [&pos_compiled]() -> ov::InferRequest {
@@ -460,11 +494,11 @@ void InputsEmbedderQwen3VL::add_interpolated_pos_embeds(
         // Patched model: pass weights, get [N, D] directly on device
         vision_embeddings_pos.set_tensor("weights", weights);
         vision_embeddings_pos.infer();
-        weighted_sum = vision_embeddings_pos.get_output_tensor();
+        weighted_sum = to_f32_tensor(vision_embeddings_pos.get_output_tensor());
     } else {
         // Original model: get [4, N, D], do CPU weighted sum
         vision_embeddings_pos.infer();
-        ov::Tensor pos_embeds = vision_embeddings_pos.get_output_tensor();
+        ov::Tensor pos_embeds = to_f32_tensor(vision_embeddings_pos.get_output_tensor());
 
         size_t num_positions = pos_embeds.get_shape()[1];
         size_t embed_dim = pos_embeds.get_shape()[2];
@@ -507,70 +541,74 @@ std::pair<ov::Tensor, ov::Tensor> InputsEmbedderQwen3VL::run_video_image_embeddi
     const std::vector<EncodedVideo>& videos,
     const std::vector<size_t>& videos_sequence
 ) {
-    auto [reordered_image_embeds, reordered_images_grid_thw] = 
+    auto [reordered_image_embeds, reordered_images_grid_thw] =
         qwen2_vl_utils::reorder_image_embeds_and_grid_thw(images, images_sequence);
-    auto [reordered_video_embeds, reordered_videos_grid_thw] = 
+    auto [reordered_video_embeds, reordered_videos_grid_thw] =
         qwen2_vl_utils::reorder_video_embeds_and_grid_thw(videos, videos_sequence);
-    
-    ov::Tensor concatenated_embeds = 
-        qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds);
-    
+
+    ov::Tensor concatenated_embeds = to_f32_tensor(
+        qwen2_vl_utils::concatenate_video_image_embeds(reordered_video_embeds, reordered_image_embeds));
+
     // Combined grid for position computation
     std::vector<std::array<size_t, 3>> combined_grid_thw;
-    combined_grid_thw.insert(combined_grid_thw.end(), 
+    combined_grid_thw.insert(combined_grid_thw.end(),
         reordered_videos_grid_thw.begin(), reordered_videos_grid_thw.end());
-    combined_grid_thw.insert(combined_grid_thw.end(), 
+    combined_grid_thw.insert(combined_grid_thw.end(),
         reordered_images_grid_thw.begin(), reordered_images_grid_thw.end());
-    
+
     if (!combined_grid_thw.empty()) {
         add_interpolated_pos_embeds(combined_grid_thw, concatenated_embeds);
     }
-    
+
     ov::Tensor rotary_pos_emb = get_rotary_pos_emb(combined_grid_thw);
-    
+
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
-    
+
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_embeds);
-    
+
     if (m_with_cu_seqlens_input) {
-        vision_embeddings_merger.set_tensor("cu_seq_lens", 
+        vision_embeddings_merger.set_tensor("cu_seq_lens",
             qwen2_vl_utils::get_cu_seqlens(reordered_images_grid_thw, reordered_videos_grid_thw));
     } else {
         vision_embeddings_merger.set_tensor("attention_mask",
             qwen2_vl_utils::get_attention_mask(reordered_images_grid_thw, reordered_videos_grid_thw));
     }
-    
+
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
     vision_embeddings_merger.infer();
-    
+
     ov::Tensor vision_embeds = vision_embeddings_merger.get_tensor("last_hidden_state");
-    
+
     if (has_lm_extra_input("deepstack_visual_embeds")) {
-        m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
+        try {
+            m_lm_extra_inputs["deepstack_visual_embeds"] = vision_embeddings_merger.get_tensor("deepstack_feature_lists");
+        } catch (const std::exception&) {
+            m_lm_extra_inputs["deepstack_visual_embeds"] = ov::Tensor();
+        }
     }
-    
+
     auto vision_embeds_shape = vision_embeds.get_shape();
-    
+
     // Split vision embeddings
     size_t video_tokens = calc_vec_tokens_num(reordered_videos_grid_thw);
     size_t image_tokens = calc_vec_tokens_num(reordered_images_grid_thw);
     size_t total_tokens = video_tokens + image_tokens;
-    
+
     size_t video_count = 0;
     if (total_tokens > 0) {
         video_count = vision_embeds_shape[0] * video_tokens / total_tokens;
     }
     size_t image_count = vision_embeds_shape[0] - video_count;
-    
+
     ov::Tensor video_embeds{vision_embeds.get_element_type(), {video_count, vision_embeds_shape[1]}};
     ov::Tensor image_embeds{vision_embeds.get_element_type(), {image_count, vision_embeds_shape[1]}};
-    
+
     std::memcpy(video_embeds.data(), vision_embeds.data(), video_embeds.get_byte_size());
     std::memcpy(image_embeds.data(),
                 static_cast<uint8_t*>(vision_embeds.data()) + video_embeds.get_byte_size(),
                 image_embeds.get_byte_size());
-    
+
     return {video_embeds, image_embeds};
 }
 
@@ -683,7 +721,7 @@ ov::Tensor InputsEmbedderQwen3VL::get_inputs_embeds(
     }
 
     if (recalculate_merged_embeddings) {
-        std::tie(m_merged_video_embeddings, m_merged_image_embeddings) = 
+        std::tie(m_merged_video_embeddings, m_merged_image_embeddings) =
             run_video_image_embeddings_merger(images, images_sequence, videos, videos_sequence);
     }
 

@@ -9,6 +9,9 @@
 #include <memory>
 
 #include "openvino/runtime/properties.hpp"
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned long __stdcall GetEnvironmentVariableA(const char* lpName, char* lpBuffer, unsigned long nSize);
+#endif
 #include "openvino/op/add.hpp"
 #include "openvino/op/divide.hpp"
 #include "openvino/op/gather.hpp"
@@ -91,8 +94,8 @@ void update_npu_config(ov::AnyMap& config,
     rename_key(config, "PREFILL_HINT", "NPUW_LLM_PREFILL_HINT");
     rename_key(config, "GENERATE_CONFIG", "NPUW_LLM_GENERATE_CONFIG");
     rename_key(config, "GENERATE_HINT", "NPUW_LLM_GENERATE_HINT");
-    rename_key(config, "SHARED_HEAD_CONFIG", "NPUW_LLM_SHARED_HEAD_CONFIG"); 
-    
+    rename_key(config, "SHARED_HEAD_CONFIG", "NPUW_LLM_SHARED_HEAD_CONFIG");
+
     rename_key(config, "++PREFILL_CONFIG", "++NPUW_LLM_PREFILL_CONFIG");
     rename_key(config, "++GENERATE_CONFIG", "++NPUW_LLM_GENERATE_CONFIG");
     rename_key(config, "++SHARED_HEAD_CONFIG", "++NPUW_LLM_SHARED_HEAD_CONFIG");
@@ -148,6 +151,33 @@ inline bool is_paged_attention_available() {
 namespace ov {
 namespace genai {
 namespace utils {
+
+std::optional<std::filesystem::path> get_runtime_model_dump_dir() {
+    const char* env = std::getenv("OV_GENAI_DUMP_RUNTIME_MODEL_DIR");
+    if (env == nullptr || *env == '\0') {
+#ifdef _WIN32
+        char buffer[4096] = {};
+        const auto len = GetEnvironmentVariableA("OV_GENAI_DUMP_RUNTIME_MODEL_DIR", buffer, static_cast<unsigned long>(std::size(buffer)));
+        if (len != 0 && len < std::size(buffer)) {
+            return std::filesystem::path(buffer);
+        }
+#endif
+        return std::nullopt;
+    }
+    return std::filesystem::path(env);
+}
+
+void dump_runtime_model_if_requested(const ov::CompiledModel& compiled_model, const std::string& file_stem) {
+    const auto dump_dir = get_runtime_model_dump_dir();
+    if (!dump_dir.has_value()) {
+        return;
+    }
+
+    std::filesystem::create_directories(*dump_dir);
+    const auto xml_path = *dump_dir / (file_stem + ".xml");
+    ov::serialize(compiled_model.get_runtime_model(), xml_path.string());
+    std::cout << "[runtime-model-dump] Saved " << xml_path << std::endl;
+}
 
 enum class ModelType { Default, Whisper, TextEmbedding };
 
@@ -487,7 +517,7 @@ CacheTypes get_cache_types(const ov::Model& model) {
         } else if (
             (rank == 3 && dynamic_axis_count == 1)  // conv state
             || (rank == 4 && dynamic_axis_count == 1 && zero_axis_count == 0)  // ssm state
-        ) {  
+        ) {
             cache_types.add_linear();
         }
     }

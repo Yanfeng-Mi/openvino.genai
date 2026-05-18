@@ -12,6 +12,7 @@
 #include "visual_language/qwen2_5_vl/classes.hpp"
 #include "visual_language/qwen3_vl/classes.hpp"
 #include "visual_language/qwen3_5/classes.hpp"
+#include "visual_language/qwen3_5_vl/classes.hpp"
 #include "visual_language/phi3_vision/classes.hpp"
 #include "visual_language/phi4mm/classes.hpp"
 #include "visual_language/minicpm/classes.hpp"
@@ -192,12 +193,12 @@ ov::Tensor InputsEmbedder::IInputsEmbedder::sample_video_if_needed(
     const VideoMetadata& video_metadata
 ) const {
     const auto& video_shape = video.get_shape();
-    
+
     OPENVINO_ASSERT(video_shape.size() == 4,
     "Video tensor must have shape {N, H, W, C}, got rank ", video_shape.size());
-    
+
     const size_t video_frames_num = video_shape[0];
-    
+
     OPENVINO_ASSERT(video_metadata.frames_indices.size() <= video_frames_num,
         "Number of frames to sample cannot be greater than total number of frames in the video.");
 
@@ -207,10 +208,10 @@ ov::Tensor InputsEmbedder::IInputsEmbedder::sample_video_if_needed(
 
     ov::Tensor sampled(video.get_element_type(),
         {video_metadata.frames_indices.size(), video_shape[1], video_shape[2], video_shape[3]});
-        
+
     const auto* src = static_cast<const uint8_t*>(video.data());
     auto* dst = static_cast<uint8_t*>(sampled.data());
-    
+
     const size_t frame_bytes = video_shape[1] * video_shape[2] * video_shape[3] * video.get_element_type().size();
 
     for (size_t i = 0; i < video_metadata.frames_indices.size(); ++i) {
@@ -351,6 +352,8 @@ InputsEmbedder::InputsEmbedder(const std::filesystem::path& model_dir,
         m_impl = std::make_shared<InputsEmbedderQwen3VL>(vlm_config, model_dir, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::QWEN3_5 || vlm_config.model_type == VLMModelType::QWEN3_5_MOE) {
         m_impl = std::make_shared<InputsEmbedderQwen3_5>(vlm_config, model_dir, device, device_config);
+    } else if (vlm_config.model_type == VLMModelType::QWEN3_5_VL) {
+        m_impl = std::make_shared<InputsEmbedderQwen3_5VL>(vlm_config, model_dir, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::GEMMA3) {
         m_impl = std::make_shared<InputsEmbedderGemma3>(vlm_config, model_dir, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::GEMMA4) {
@@ -393,12 +396,14 @@ InputsEmbedder::InputsEmbedder(const ModelsMap& models_map,
         m_impl = std::make_shared<InputsEmbedderQwen3VL>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::QWEN3_5 || vlm_config.model_type == VLMModelType::QWEN3_5_MOE) {
         m_impl = std::make_shared<InputsEmbedderQwen3_5>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
+    } else if (vlm_config.model_type == VLMModelType::QWEN3_5_VL) {
+        m_impl = std::make_shared<InputsEmbedderQwen3_5VL>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::GEMMA3) {
         m_impl = std::make_shared<InputsEmbedderGemma3>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::GEMMA4) {
         m_impl = std::make_shared<InputsEmbedderGemma4>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
     } else if (vlm_config.model_type == VLMModelType::VIDEOCHAT_FLASH_QWEN) {
-        m_impl = std::make_shared<InputsEmbedderVideoChatFlashQwen>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config); 
+        m_impl = std::make_shared<InputsEmbedderVideoChatFlashQwen>(vlm_config, models_map, tokenizer, config_dir_path, device, device_config);
     } else {
         OPENVINO_THROW("Unsupported model type in VLM InputsEmbedder class. Please, create feature request on new model support");
     }
