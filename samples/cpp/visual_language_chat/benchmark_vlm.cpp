@@ -2,11 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cxxopts.hpp>
+#include <cstdlib>
 #include <filesystem>
+
+#ifdef _WIN32
+extern "C" __declspec(dllimport) int __stdcall SetEnvironmentVariableA(const char* lpName, const char* lpValue);
+#endif
 
 #include "load_image.hpp"
 #include <openvino/genai/visual_language/pipeline.hpp>
 #include "../text_generation/read_prompt_from_file.h"
+
+namespace {
+
+void set_runtime_model_dump_dir(const std::string& dump_dir) {
+#ifdef _WIN32
+    SetEnvironmentVariableA("OV_GENAI_DUMP_RUNTIME_MODEL_DIR", dump_dir.c_str());
+    _putenv_s("OV_GENAI_DUMP_RUNTIME_MODEL_DIR", dump_dir.c_str());
+#else
+    setenv("OV_GENAI_DUMP_RUNTIME_MODEL_DIR", dump_dir.c_str(), 1);
+#endif
+}
+
+}  // namespace
 
 int main(int argc, char* argv[]) try {
     cxxopts::Options options("benchmark_vlm", "Help command");
@@ -20,6 +38,8 @@ int main(int argc, char* argv[]) try {
     ("n,num_iter", "Number of iterations", cxxopts::value<size_t>()->default_value(std::to_string(3)))
     ("mt,max_new_tokens", "Maximal number of new tokens", cxxopts::value<size_t>()->default_value(std::to_string(20)))
     ("d,device", "device", cxxopts::value<std::string>()->default_value("CPU"))
+    ("dump-runtime-model-dir", "Dump compiled runtime models to directory", cxxopts::value<std::string>())
+    ("disable-continuous-batching", "Use the default VLMPipeline path instead of the ContinuousBatching adapter on non-NPU devices")
     ("pr,pruning_ratio", "(optional): Percentage of visual tokens to prune (valid range: 0-100); if this option is not provided, pruning is disabled.", cxxopts::value<size_t>())
     ("rw,relevance_weight", "(optional): Float value from 0 to 1, controls the trade-off between diversity and relevance for visual tokens pruning; a value of 0 disables relevance weighting, while higher values (up to 1.0) emphasize relevance, making pruning more conservative on borderline tokens.", cxxopts::value<float>())
     ("h,help", "Print usage");
@@ -52,11 +72,17 @@ int main(int argc, char* argv[]) try {
     if (prompt.empty()) {
         std::cout << "Prompt is empty!" << std::endl;
         return EXIT_FAILURE;
-    } 
+    }
 
     const std::string models_path = result["model"].as<std::string>();
     const std::string image_path = result["image"].as<std::string>();
     std::string device = result["device"].as<std::string>();
+    const bool disable_continuous_batching = result.count("disable-continuous-batching") > 0;
+    if (result.count("dump-runtime-model-dir")) {
+        const auto dump_dir = result["dump-runtime-model-dir"].as<std::string>();
+        set_runtime_model_dump_dir(dump_dir);
+        std::cout << "[runtime-model-dump] Enabled at " << dump_dir << std::endl;
+    }
     size_t num_warmup = result["num_warmup"].as<size_t>();
     size_t num_iter = result["num_iter"].as<size_t>();
     std::vector<ov::Tensor> images = utils::load_images(image_path);
@@ -74,23 +100,33 @@ int main(int argc, char* argv[]) try {
     std::cout << ov::get_openvino_version() << std::endl;
 
     std::unique_ptr<ov::genai::VLMPipeline> pipe;
-    if (device == "NPU")
-        pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device);
-    else {
+    std::string pipeline_mode;
+    if (device == "NPU" || disable_continuous_batching) {
+        ov::AnyMap properties;
+        if (disable_continuous_batching && device != "NPU") {
+            properties["ATTENTION_BACKEND"] = std::string("SDPA");
+            pipeline_mode = "stateful";
+        } else {
+            pipeline_mode = "default";
+        }
+        pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device, properties);
+    } else {
         // Setting of Scheduler config will trigger usage of ContinuousBatching pipeline, which is not default for Qwen2VL, Qwen2.5VL, Gemma3 due to accuracy issues.
         ov::genai::SchedulerConfig scheduler_config;
         scheduler_config.enable_prefix_caching = false;
         scheduler_config.max_num_batched_tokens = std::numeric_limits<std::size_t>::max();
         pipe = std::make_unique<ov::genai::VLMPipeline>(models_path, device, ov::genai::scheduler_config(scheduler_config));
+        pipeline_mode = "continuous_batching";
     }
 
     auto input_data = pipe->get_tokenizer().encode(prompt);
     size_t prompt_token_size = input_data.input_ids.get_shape()[1];
-    std::cout << "Number of images:" << images.size() << ", prompt token size:" << prompt_token_size << std::endl;
+    std::cout << "Pipeline mode: " << pipeline_mode << std::endl;
+    std::cout << "Number of images:" << images.size() << ", text prompt token size:" << prompt_token_size << std::endl;
 
     for (size_t i = 0; i < num_warmup; i++)
         pipe->generate(prompt, ov::genai::images(images), ov::genai::generation_config(config));
-    
+
     auto res = pipe->generate(prompt, ov::genai::images(images), ov::genai::generation_config(config));
     auto metrics = res.perf_metrics;
     for (size_t i = 0; i < num_iter - 1; i++) {
@@ -99,15 +135,23 @@ int main(int argc, char* argv[]) try {
     }
 
     std::cout << std::fixed << std::setprecision(2);
+    std::cout << "Actual input token size: " << res.perf_metrics.get_num_input_tokens() << std::endl;
     std::cout << "Output token size:" << res.perf_metrics.get_num_generated_tokens() << std::endl;
     std::cout << "Load time: " << metrics.get_load_time() << " ms" << std::endl;
     std::cout << "Generate time: " << metrics.get_generate_duration().mean << " ± " << metrics.get_generate_duration().std << " ms" << std::endl;
+    std::cout << "Vision encode time: " << metrics.get_vision_encode_duration().mean << " ± " << metrics.get_vision_encode_duration().std << " ms" << std::endl;
+    std::cout << "Prompt normalize time: " << metrics.get_prompt_normalize_duration().mean << " ± " << metrics.get_prompt_normalize_duration().std << " ms" << std::endl;
     std::cout << "Tokenization time: " << metrics.get_tokenization_duration().mean << " ± " << metrics.get_tokenization_duration().std << " ms" << std::endl;
     std::cout << "Detokenization time: " << metrics.get_detokenization_duration().mean << " ± " << metrics.get_detokenization_duration().std << " ms" << std::endl;
     std::cout << "Embeddings preparation time: " << metrics.get_prepare_embeddings_duration().mean << " ± " << metrics.get_prepare_embeddings_duration().std << " ms" << std::endl;
+    std::cout << "Text prefill infer time: " << metrics.get_prefill_inference_duration().mean << " ± " << metrics.get_prefill_inference_duration().std << " ms" << std::endl;
     std::cout << "TTFT: " << metrics.get_ttft().mean  << " ± " << metrics.get_ttft().std << " ms" << std::endl;
     std::cout << "TPOT: " << metrics.get_tpot().mean  << " ± " << metrics.get_tpot().std << " ms/token " << std::endl;
     std::cout << "Throughput: " << metrics.get_throughput().mean  << " ± " << metrics.get_throughput().std << " tokens/s" << std::endl;
+    if (!res.texts.empty()) {
+        std::cout << "Last output:" << std::endl;
+        std::cout << res.texts[0] << std::endl;
+    }
 
     return 0;
 } catch (const std::exception& error) {
