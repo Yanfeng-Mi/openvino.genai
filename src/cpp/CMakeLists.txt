@@ -3,6 +3,10 @@
 #
 
 file(GLOB_RECURSE SOURCE_FILES "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c")
+file(GLOB modeling_tests_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/tests/*.cpp")
+file(GLOB modeling_samples_src "${CMAKE_CURRENT_SOURCE_DIR}/src/modeling/samples/*.cpp")
+list(REMOVE_ITEM SOURCE_FILES ${modeling_tests_src})
+list(REMOVE_ITEM SOURCE_FILES ${modeling_samples_src})
 list(APPEND SOURCE_FILES "${CMAKE_CURRENT_BINARY_DIR}/version.cpp")
 
 # Dependencies
@@ -101,6 +105,8 @@ FetchContent_Declare(safetensors.h
     URL_HASH SHA256=9aaf5961609601cf9aaa96582a207bce7c6e5fbf57ed2cc669bb7bde6a937d4b)
 FetchContent_MakeAvailable(safetensors.h)
 
+add_subdirectory(src/modeling)
+
 if(ENABLE_GGUF)
     FetchContent_Declare(
       gguflib
@@ -181,6 +187,15 @@ if(NOT ENABLE_GGUF)
     list(REMOVE_ITEM SOURCE_FILES ${GGUF_SOURCES})
 endif()
 
+if(NOT ENABLE_GGUF OR NOT ENABLE_SAFETENSORS)
+    set(SAFETENSORS_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/hf_config.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_loader.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_modeling.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_source.cpp
+                            ${CMAKE_CURRENT_SOURCE_DIR}/src/safetensors_utils/safetensors_weight_finalizer.cpp)
+    list(REMOVE_ITEM SOURCE_FILES ${SAFETENSORS_SOURCES})
+endif()
+
 set(TARGET_NAME openvino_genai)
 set(TARGET_NAME_OBJ ${TARGET_NAME}_obj)
 
@@ -200,9 +215,13 @@ if(ENABLE_GGUF)
     target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_GGUF)
 endif()
 
+if(ENABLE_GGUF AND ENABLE_SAFETENSORS)
+    target_compile_definitions(${TARGET_NAME_OBJ} PRIVATE ENABLE_SAFETENSORS)
+endif()
+
 target_include_directories(${TARGET_NAME_OBJ} SYSTEM PRIVATE "${safetensors.h_SOURCE_DIR}")
 
-target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::threading nlohmann_json::nlohmann_json minja)
+target_link_libraries(${TARGET_NAME_OBJ} PRIVATE openvino::runtime openvino::core::dev openvino::threading nlohmann_json::nlohmann_json minja)
 
 # Add OpenCL support if enabled via OpenVINO configuration
 if(ENABLE_SYSTEM_OPENCL AND TARGET OpenCL::OpenCL AND (DEFINED OpenCL_HPP_INCLUDE_DIR OR DEFINED CL2_HPP_INCLUDE_DIR))
