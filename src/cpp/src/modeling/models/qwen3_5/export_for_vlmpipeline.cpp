@@ -428,10 +428,11 @@ void export_qwen3_5_for_vlmpipeline(
     generate_vlmpipeline_config(cfg, output_dir);
     generate_preprocessor_config(cfg, output_dir);
 
-    // 7. Copy tokenizer files if present
+    // 7. Copy generation and tokenizer files if present
     for (const auto& tokenizer_file : {"tokenizer.json", "tokenizer_config.json",
                                         "special_tokens_map.json", "vocab.json",
-                                        "merges.txt", "openvino_tokenizer.xml",
+                                        "merges.txt", "generation_config.json",
+                                        "openvino_tokenizer.xml",
                                         "openvino_tokenizer.bin", "openvino_detokenizer.xml",
                                         "openvino_detokenizer.bin"}) {
         auto src_path = model_dir / tokenizer_file;

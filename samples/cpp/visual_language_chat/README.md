@@ -84,11 +84,13 @@ benchmark_vlm [OPTIONS]
 ### Options
 
 - `-m, --model`(default: `.`): Path to the model and tokenizers base directory.
-- `-p, --prompt` (default: ''): The prompt to generate text. If without `-p` and `--pf`, the default prompt is `"What is on the image?"`
-- `--pf, --prompt_file` Read prompt from file.
+- `-p, --prompt` (default: ''): The prompt to generate text. If without `-p` and prompt file options, the default prompt is `"What is on the image?"`.
+- `--pf`, `--prompt-file`: Read prompt from file. Mutually exclusive with `-p, --prompt`. The legacy `--prompt_file` spelling is also accepted.
 - `-i, --image` (default: `image.jpg`): Path to the image.
 - `-nw, --num_warmup` (default: `1`): Number of warmup iterations.
 - `-mt, --max_new_tokens` (default: `20`): Maximal number of new tokens.
+- `--ignore_eos`: Ignore EOS and generate until `max_new_tokens` is reached.
+- `--think` (default: `1`): Enable thinking mode in chat template. Use `0` to disable thinking mode for templates that support `enable_thinking`.
 - `-n, --num_iter` (default: `3`): Number of iterations.
 - `-d, --device` (default: `"CPU"`): Device to run the model on.
 - `-pr, --pruning_ratio`: (optional): Percentage of visual tokens to prune (valid range: 0-100); if this option is not provided, pruning is disabled.

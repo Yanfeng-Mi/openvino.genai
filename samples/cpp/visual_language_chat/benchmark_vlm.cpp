@@ -33,10 +33,13 @@ int main(int argc, char* argv[]) try {
     ("m,model", "Path to model and tokenizers base directory", cxxopts::value<std::string>()->default_value("."))
     ("p,prompt", "Prompt", cxxopts::value<std::string>()->default_value(""))
     ("pf,prompt_file", "Read prompt from file", cxxopts::value<std::string>())
+    ("prompt-file", "Read prompt from file", cxxopts::value<std::string>())
     ("i,image", "Image", cxxopts::value<std::string>()->default_value("image.jpg"))
     ("nw,num_warmup", "Number of warmup iterations", cxxopts::value<size_t>()->default_value(std::to_string(1)))
     ("n,num_iter", "Number of iterations", cxxopts::value<size_t>()->default_value(std::to_string(3)))
     ("mt,max_new_tokens", "Maximal number of new tokens", cxxopts::value<size_t>()->default_value(std::to_string(20)))
+    ("ignore_eos", "Ignore EOS and generate until max_new_tokens is reached")
+    ("think", "Enable thinking mode in chat template: 0 or 1", cxxopts::value<int>()->default_value("1"))
     ("d,device", "device", cxxopts::value<std::string>()->default_value("CPU"))
     ("dump-runtime-model-dir", "Dump compiled runtime models to directory", cxxopts::value<std::string>())
     ("disable-continuous-batching", "Use the default VLMPipeline path instead of the ContinuousBatching adapter on non-NPU devices")
@@ -58,13 +61,21 @@ int main(int argc, char* argv[]) try {
         return EXIT_SUCCESS;
     }
 
+    const bool has_prompt_file = result.count("prompt_file") > 0 || result.count("prompt-file") > 0;
+    if (result.count("prompt_file") > 0 && result.count("prompt-file") > 0) {
+        std::cout << "Only one prompt file option should be specified!" << std::endl;
+        return EXIT_FAILURE;
+    }
+
     std::string prompt;
-    if (result.count("prompt") && result.count("prompt_file")) {
+    if (result.count("prompt") && has_prompt_file) {
         std::cout << "Prompt and prompt file should not exist together!" << std::endl;
         return EXIT_FAILURE;
     } else {
-        if (result.count("prompt_file")) {
-            prompt = utils::read_prompt(result["prompt_file"].as<std::string>());
+        if (has_prompt_file) {
+            const auto prompt_file = result.count("prompt_file") > 0 ?
+                result["prompt_file"].as<std::string>() : result["prompt-file"].as<std::string>();
+            prompt = utils::read_prompt(prompt_file);
         } else {
             prompt = result["prompt"].as<std::string>().empty() ? "What is on the image?" : result["prompt"].as<std::string>();
         }
@@ -78,6 +89,12 @@ int main(int argc, char* argv[]) try {
     const std::string image_path = result["image"].as<std::string>();
     std::string device = result["device"].as<std::string>();
     const bool disable_continuous_batching = result.count("disable-continuous-batching") > 0;
+    const int think_value = result["think"].as<int>();
+    if (think_value != 0 && think_value != 1) {
+        std::cout << "--think must be 0 or 1" << std::endl;
+        return EXIT_FAILURE;
+    }
+    const bool enable_thinking = think_value != 0;
     if (result.count("dump-runtime-model-dir")) {
         const auto dump_dir = result["dump-runtime-model-dir"].as<std::string>();
         set_runtime_model_dump_dir(dump_dir);
@@ -95,7 +112,7 @@ int main(int argc, char* argv[]) try {
         config.relevance_weight = result["relevance_weight"].as<float>();
     }
     config.max_new_tokens = result["max_new_tokens"].as<size_t>();
-    config.ignore_eos = true;
+    config.ignore_eos = result.count("ignore_eos") > 0;
 
     std::cout << ov::get_openvino_version() << std::endl;
 
@@ -124,13 +141,19 @@ int main(int argc, char* argv[]) try {
     std::cout << "Pipeline mode: " << pipeline_mode << std::endl;
     std::cout << "Number of images:" << images.size() << ", text prompt token size:" << prompt_token_size << std::endl;
 
+    auto generate_once = [&]() {
+        ov::genai::ChatHistory history({{{"role", "user"}, {"content", prompt}}});
+        history.set_extra_context(ov::genai::JsonContainer({{"enable_thinking", enable_thinking}}));
+        return pipe->generate(history, ov::genai::images(images), ov::genai::generation_config(config));
+    };
+
     for (size_t i = 0; i < num_warmup; i++)
-        pipe->generate(prompt, ov::genai::images(images), ov::genai::generation_config(config));
+        generate_once();
     
-    auto res = pipe->generate(prompt, ov::genai::images(images), ov::genai::generation_config(config));
+    auto res = generate_once();
     auto metrics = res.perf_metrics;
     for (size_t i = 0; i < num_iter - 1; i++) {
-        res = pipe->generate(prompt, ov::genai::images(images), ov::genai::generation_config(config));
+        res = generate_once();
         metrics = metrics + res.perf_metrics;
     }
 

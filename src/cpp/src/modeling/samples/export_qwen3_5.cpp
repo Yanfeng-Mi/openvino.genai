@@ -24,7 +24,7 @@
 ///   openvino_vision_embeddings_pos_model.xml/bin
 ///   openvino_text_embeddings_model.xml/bin
 ///   openvino_language_model.xml/bin
-///   config.json, preprocessor_config.json, tokenizer files
+///   config.json, preprocessor_config.json, generation_config.json if present, tokenizer files
 ///
 /// After export, load with VLMPipeline:
 ///   ov::genai::VLMPipeline pipe(output_dir, "GPU");
